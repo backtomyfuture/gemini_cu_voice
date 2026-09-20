@@ -235,7 +235,9 @@ SYSTEM_INSTRUCTION = """
    - 然后通过 get_app_state 获取显示结果并告知用户。
 3. 网页与搜索操作规范：
    - 搜资料/查新闻/看网页：直接调用 browser_search(query="关键词") 或 browser_open(url="网址")；
-   - 工具返回正文后，结合正文用流畅、生动的口语为用户概括回答核心内容。
+   - 【果断总结，拒绝反复换词搜索】：单次用户提问中，browser_search 最多执行 1 次（特殊情况最多 2 次）。工具一旦返回正文或搜索结果，必须立刻结合已有信息用流畅自然的口语为用户总结核心内容！严禁为了追求所谓完美而连续 3 次以上微调细微关键词反复搜索，避免让用户产生长时间静默等待！
+   - 点击网页链接或内容：调用 browser_click(text="要点击的链接文字")；
+   - 浏览更多内容：调用 browser_scroll(direction="down")。
 
 【交互与口语原则】：
 1. 【静默动作，一次性总结汇报】：
@@ -404,6 +406,7 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
     is_ready_to_listen = False
     has_active_tool = False
     waiting_tool_summary = False
+    is_interrupted = False
     calib_samples = []
 
     def set_state(new_state):
@@ -415,7 +418,7 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
             log_event("STATE", f"Transitioned to {new_state}")
 
     def mic_callback(indata, frames, time_info, status):
-        nonlocal is_speaking, attack_count, silence_count, audio_buffer, rms_history, state, interrupt_frames, START_THRESHOLD, HOLD_THRESHOLD, MIN_PEAK_RMS, INTERRUPT_RMS
+        nonlocal is_speaking, attack_count, silence_count, audio_buffer, rms_history, state, interrupt_frames, START_THRESHOLD, HOLD_THRESHOLD, MIN_PEAK_RMS, INTERRUPT_RMS, is_interrupted
         
         # 1. 通道解包与单/双发射器智能混音
         if mic_channels == 2:
@@ -452,6 +455,7 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
             if rms >= INTERRUPT_RMS:
                 interrupt_frames += 1
                 if interrupt_frames >= 3:
+                    is_interrupted = True
                     player.interrupt()
                     set_state(STATE_LISTENING)
                     is_speaking = True
@@ -479,6 +483,7 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
             if rms >= 360:
                 interrupt_frames += 1
                 if interrupt_frames >= 5:
+                    is_interrupted = True
                     set_state(STATE_LISTENING)
                     is_speaking = True
                     audio_buffer = [raw_bytes]
@@ -553,6 +558,7 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
                         return
 
                     # 确认为近场清晰指令，投递给 Gemini 并转为 THINKING
+                    is_interrupted = False
                     set_state(STATE_THINKING)
                     log_event("USER_VOICE", f"Captured voice of {dur_sec:.2f}s (peak={peak_rms}, {len(full_turn)} bytes), sending to Gemini")
                     sys.stdout.write(f"\r⚡ [\033[1;33m正在发送语音至 Gemini 3.8 Live...\033[0m]                       \n")
@@ -629,7 +635,7 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
                 log_event("SEND_ERROR", str(e))
 
         async def recv_loop():
-            nonlocal state, has_active_tool, waiting_tool_summary
+            nonlocal state, has_active_tool, waiting_tool_summary, is_interrupted
             try:
                 while not shutdown_event.is_set() and not reconnect_event.is_set():
                     response = await session._receive()
@@ -642,6 +648,7 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
                         set_state(STATE_LISTENING)
                         has_active_tool = False
                         waiting_tool_summary = False
+                        is_interrupted = False
                         log_event("SERVER_INTERRUPT", "Server reported interrupted")
 
                     # 2. 检查模型语音或文字
@@ -658,6 +665,8 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
                                     sys.stdout.write(part.text)
                                 sys.stdout.flush()
                             if part.inline_data:
+                                if is_interrupted:
+                                    continue
                                 set_state(STATE_SPEAKING)
                                 player.write(part.inline_data.data)
 
@@ -761,6 +770,7 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
                                     await asyncio.sleep(0.05)
                                 await asyncio.sleep(0.1)
                                 set_state(STATE_LISTENING)
+                                is_interrupted = False
                                 log_event("TURN_COMPLETE", "Turn fully finished and playback done, now LISTENING")
                                 sys.stdout.write("\n🟢 [\033[1;32m就绪，请说下一句指令...\033[0m]\n")
                                 sys.stdout.flush()

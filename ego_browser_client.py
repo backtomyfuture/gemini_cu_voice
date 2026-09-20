@@ -136,25 +136,50 @@ console.log(JSON.stringify({{ ok: true, title, url: currentUrl, text: text.slice
 
 async def browser_click(text_or_selector: str) -> str:
     """
-    在当前页面点击指定文字或选择器
+    在当前页面点击指定文字或选择器（支持智能模糊匹配与自动容错）
     """
     target = text_or_selector.strip()
+    safe_target = json.dumps(target)
     code = f"""const task = await taskSpace("voice assistant web");
 const page = task.page("p1");
+const raw = {safe_target};
 try {{
-    if ("{target}".startsWith("#") || "{target}".startsWith(".") || "{target}".startsWith("loc=")) {{
-        await page.click("{target}");
+    let clicked = false;
+    // 1. 如果是 css/xpath/loc 选择器
+    if (raw.startsWith("#") || raw.startsWith(".") || raw.startsWith("loc=") || raw.startsWith("//")) {{
+        await page.click(raw, {{ timeout: 3000 }});
+        clicked = true;
     }} else {{
-        await page.click('text="{target}"');
+        // 2. 尝试模糊包含文本匹配 (exact: false)
+        const loc = page.getByText(raw, {{ exact: false }}).first();
+        if (await loc.count() > 0) {{
+            await loc.click({{ timeout: 3000 }});
+            clicked = true;
+        }} else {{
+            // 3. 尝试取前 8 个主要字词作为关键词模糊尝试
+            const shortWord = raw.slice(0, 8).trim();
+            if (shortWord.length >= 2) {{
+                const loc2 = page.getByText(shortWord, {{ exact: false }}).first();
+                if (await loc2.count() > 0) {{
+                    await loc2.click({{ timeout: 3000 }});
+                    clicked = true;
+                }}
+            }}
+            if (!clicked) {{
+                // 4. 终极回退
+                await page.click('text=' + JSON.stringify(raw), {{ timeout: 2500 }});
+                clicked = true;
+            }}
+        }}
     }}
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(600);
     const title = await page.title();
     console.log(JSON.stringify({{ ok: true, message: "点击成功", title }}));
 }} catch (e) {{
     console.log(JSON.stringify({{ ok: false, error: String(e) }}));
 }}
 """
-    res = await run_ego_js(code, timeout=8.0)
+    res = await run_ego_js(code, timeout=9.0)
     if res.get("ok"):
         return f"已成功点击 '{target}'，当前页面标题: {res.get('title', '')}"
     return f"点击失败: {res.get('error')}"
