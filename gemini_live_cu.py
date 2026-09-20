@@ -88,6 +88,93 @@ def clean_ax_text(raw_text: str, max_chars: int = 1800) -> str:
         result = result[:max_chars] + "\n...(已精简提取)"
     return result
 
+def format_app_list(raw_json: str) -> str:
+    """将 list_apps 返回的 JSON 格式化为直观易懂的应用列表"""
+    try:
+        import json
+        data = json.loads(raw_json)
+        apps = data.get("apps", [])
+        lines = ["【当前正在运行的应用程序】:"]
+        ignore_system = {"WindowManager", "Dock", "SystemUIServer", "loginwindow"}
+        for a in apps:
+            name = a.get("name", "")
+            bid = a.get("bundle_id", "")
+            if name and name not in ignore_system:
+                lines.append(f"- {name} (bundle_id: \"{bid}\", pid: {a.get('pid')})")
+        return "\n".join(lines)
+    except Exception:
+        return raw_json[:800]
+
+def format_tool_result(func_name: str, raw_text: str) -> str:
+    """智能分发各工具的输出，杜绝把所有工具误送进 AX 树清洗器"""
+    if func_name == "get_app_state":
+        return clean_ax_text(raw_text, max_chars=1800)
+    elif func_name == "list_apps":
+        return format_app_list(raw_text)
+    else:
+        # press_key, type_text, click, open_app 等操作类工具直接返回真实状态
+        if len(raw_text) > 500:
+            return raw_text[:500] + "..."
+        return raw_text if raw_text.strip() else "ok"
+
+def launch_mac_app(app_name: str, bundle_id: str = "") -> str:
+    """原生极速启动/激活 macOS 应用程序"""
+    name_map = {
+        "计算器": "Calculator",
+        "备忘录": "Notes",
+        "日历": "Calendar",
+        "地图": "Maps",
+        "音乐": "Music",
+        "网易云音乐": "NeteaseMusic",
+        "播客": "Podcasts",
+        "微信": "WeChat",
+        "飞书": "Feishu",
+        "邮件": "Mail",
+        "终端": "Terminal",
+        "访达": "Finder",
+        "相册": "Photos",
+        "照片": "Photos",
+        "提醒事项": "Reminders",
+        "系统设置": "System Settings",
+        "设置": "System Settings",
+    }
+    bid_map = {
+        "calculator": "com.apple.calculator",
+        "计算器": "com.apple.calculator",
+        "notes": "com.apple.Notes",
+        "备忘录": "com.apple.Notes",
+        "safari": "com.apple.Safari",
+        "chrome": "com.google.Chrome",
+        "calendar": "com.apple.iCal",
+        "日历": "com.apple.iCal",
+        "wechat": "com.tencent.xinWeChat",
+        "微信": "com.tencent.xinWeChat",
+        "feishu": "com.electron.lark",
+        "飞书": "com.electron.lark",
+        "mail": "com.apple.mail",
+        "邮件": "com.apple.mail",
+    }
+    
+    # 优先 bundle_id
+    target_bid = bundle_id or bid_map.get(app_name.lower())
+    if target_bid:
+        res = subprocess.run(["open", "-b", target_bid], capture_output=True, text=True)
+        if res.returncode == 0:
+            return f"成功打开并激活应用: {app_name} (bundle_id: {target_bid})"
+            
+    # 其次按映射英文名或原始名打开
+    target_name = name_map.get(app_name, app_name)
+    res = subprocess.run(["open", "-a", target_name], capture_output=True, text=True)
+    if res.returncode == 0:
+        return f"成功打开并激活应用: {target_name}"
+        
+    # 回退尝试原始中文名
+    res2 = subprocess.run(["open", "-a", app_name], capture_output=True, text=True)
+    if res2.returncode == 0:
+        return f"成功打开并激活应用: {app_name}"
+        
+    return f"未能打开应用 '{app_name}': {res.stderr or res2.stderr or '未找到对应应用程序'}"
+
 # 自动配置本地代理端口（若未显式配置）
 if not os.environ.get("http_proxy") and not os.environ.get("https_proxy"):
     for port in [7890, 7897, 10808]:
@@ -109,43 +196,45 @@ MODEL_THINKING = "gemini-3.8-live-extended-thinking"
 
 SYSTEM_INSTRUCTION = """
 你是一个运行在 macOS 上的实时语音电脑操作管家。
-你的所有电脑操作都完全通过本机的 kimi-cu MCP 工具执行（严禁调用系统外挂或假命令）。
+你能操控 macOS 桌面上的所有应用和窗口。
 
-你拥有的 kimi-cu MCP 原生工具包含：
-- list_apps: 查看当前正在运行的所有应用程序（包含 name, bundle_id, pid）。操作前优先用此工具确认目标应用是否在运行。
+【工具能力与使用规则】：
+- open_app: 打开或前台激活任意应用程序（计算器、备忘录、Safari、微信、音乐等）。用户要求“打开XXX”时必须优先调用此工具！
+- list_apps: 查看当前正在运行的所有应用程序（包含 name, bundle_id, pid）。操作前可用此工具确认目标应用是否在运行。
 - get_app_state: 获取指定应用的窗口控件树（参数 app 传 bundle_id，mode 建议使用 'ax' 获取极速控件树，每个控件都有唯一的 index）。
 - click: 点击目标应用的控件（传 app 和控件 index，或点击坐标 x, y）。
 - type_text: 向目标应用输入文本（支持 clear=True 清空后输入，submit=True 按回车提交）。
-- press_key: 向应用发送按键或快捷键（如 return, enter, escape, cmd+space, cmd+c, cmd+v, cmd+w, ctrl+cmd+f 等，参数 app 传 bundle_id）。
+- press_key: 向应用发送按键或快捷键（如 return, enter, escape, cmd+c, cmd+v, cmd+w, ctrl+cmd+f 等，参数 app 传 bundle_id）。
 - scroll: 滚动应用窗口。
 - set_value: 直接设置输入框内容。
 - select_text: 选取文本内容。
-- drag / drag_paths: 拖拽操作。
 
-【浏览器（Safari / Chrome）识别与操作规范】：
-1. 查找浏览器：当用户提到“浏览器”时，先调用 list_apps 检查正在运行的浏览器：
-   - Safari: bundle_id 为 "com.apple.Safari"
-   - Google Chrome: bundle_id 为 "com.google.Chrome"
-2. 将浏览器放到当前屏幕 / 激活置顶全屏展示：
-   - 当用户要求“把浏览器放到当前屏幕”、“打开浏览器”、“最大化浏览器”时，调用 press_key(app="com.apple.Safari", keys="ctrl+cmd+f", activate=True) 直接将 Safari 窗口在当前主屏幕置顶全屏展示！
-3. 总结或查看网页内容：
-   - 直接调用 get_app_state(app="com.apple.Safari", mode="ax") 获取网页文本。拿到返回的页面主要文本与新闻后，用自然流畅的中文口语直接向用户总结重点（提炼 2-3 条核心标题或要点）。
-   - 若系统提示“当前应用暂无打开的前台主窗口”，可先调用 press_key(app="com.apple.Safari", keys="cmd+n", activate=True) 打开新窗口。
-4. 浏览器内常用操作：
-   - 聚焦地址栏并输入网址：先调用 press_key(app="com.apple.Safari", keys="cmd+l", activate=True)，随后调用 type_text(app="com.apple.Safari", text="目标网址", clear=True, submit=True)。
-   - 刷新页面：press_key(app="com.apple.Safari", keys="cmd+r")
-   - 新建标签：press_key(app="com.apple.Safari", keys="cmd+t")
-   - 关闭标签：press_key(app="com.apple.Safari", keys="cmd+w")
-   - 滚动页面：scroll(app="com.apple.Safari", count=5, direction="down")
+【应用启动与操作规范】：
+1. 打开任何应用程序（计算器、备忘录、音乐、微信、日历、Safari、Chrome 等）：
+   - 当用户要求打开软件时，直接调用 open_app(name="应用名")！
+     例如：
+     - 打开计算器 -> open_app(name="计算器")
+     - 打开备忘录 -> open_app(name="备忘录")
+     - 打开微信 -> open_app(name="微信")
+     - 打开Safari -> open_app(name="Safari")
+   - open_app 执行成功后应用即已在前台。严禁反复用 cmd+space 重试打开！直接向用户简练汇报“已为您打开计算器”。
+2. 计算器操作规范：
+   - 打开计算器后，bundle_id 为 "com.apple.calculator"；
+   - 可以在计算器中输入算式或按键：例如调用 type_text(app="com.apple.calculator", text="128*4=", submit=True)，或通过 press_key 输入按键；
+   - 然后通过 get_app_state 获取显示结果并告知用户。
+3. 浏览器（Safari / Chrome）操作规范：
+   - Safari 的 bundle_id 为 "com.apple.Safari"；Chrome 为 "com.google.Chrome"；
+   - 置顶全屏：press_key(app="com.apple.Safari", keys="ctrl+cmd+f", activate=True)；
+   - 访问网址：press_key(app="com.apple.Safari", keys="cmd+l", activate=True)，随后 type_text(app="com.apple.Safari", text="网址", clear=True, submit=True)；
+   - 提取网页内容：get_app_state(app="com.apple.Safari", mode="ax")，拿到返回正文后为用户简明口语总结。
 
-【核心交互与口语原则】：
-1. 【静默执行，最终统一汇报（Action-First, Silent Execution）】：
-   - 当需要调用工具操作电脑时，直接调用 kimi-cu 工具执行！
-   - 严禁在调用工具前说废话（例如“好的，正在为您打开”、“我来帮您看”）；
-   - 严禁在多步工具执行的中间过程口头提示“第X步已完成”、“操作已完成”、“已打开浏览器”等；
-   - 保持安静迅速地执行所有动作。只有当全部动作彻底完成，或者拿到网页内容后，才一次性用简练自然的中文口语向用户做最终总结汇报！
+【交互与口语原则】：
+1. 【静默动作，一次性总结汇报】：
+   - 执行操作时直接下发工具，不要在调用前说废话；
+   - 动作执行成功后，用简明自然的中文口语告知用户最终结果（如“计算器已为您打开”）；
+   - 严禁对同一动作连续死循环重复调用！若工具已成功返回，立即结束动作并作口语回复。
 2. 【日常问答自然连贯】：
-   - 如果用户只是打招呼或咨询日常问题（不涉及电脑操作），一次性把话说完整，切忌断词卡壳。
+   - 用户日常打招呼或闲聊时，口语自然流畅地回答。
 """
 
 # 音频参数
@@ -376,11 +465,11 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
             sys.stdout.flush()
             return
 
-        # 3. 正在思考/等待工具结果汇总中：静默防护，丢弃微小杂音，支持高声打断
+        # 3. 正在思考/等待工具结果汇总中：静默防护，大幅提高打断门限，防止呼吸声与背景噪声误打断
         if state == STATE_THINKING:
-            if rms >= INTERRUPT_RMS:
+            if rms >= 360:
                 interrupt_frames += 1
-                if interrupt_frames >= 4:
+                if interrupt_frames >= 5:
                     set_state(STATE_LISTENING)
                     is_speaking = True
                     audio_buffer = [raw_bytes]
@@ -581,20 +670,29 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
 
                             t_start = time.time()
                             try:
-                                mcp_res = await mcp_session.call_tool(func_name, func_args)
-                                cost_ms = int((time.time() - t_start) * 1000)
-                                texts = []
-                                for item in mcp_res.content:
-                                    if hasattr(item, "text") and item.text:
-                                        texts.append(item.text)
-                                    elif hasattr(item, "data"):
-                                        texts.append("[截图像素数据已捕获]")
-                                raw_text = "\n".join(texts) if texts else "ok"
-                                
-                                # 高密度精简提取，杜绝超长文本阻塞 WebSocket 音频推理
-                                res_text = clean_ax_text(raw_text, max_chars=1800)
-                                log_event("MCP_RESULT", f"{func_name} ({cost_ms}ms) raw={len(raw_text)} chars, cleaned={len(res_text)} chars")
-                                print(f"✨ [kimi-cu 完成] {func_name} ({cost_ms}ms, 提取有效内容 {len(res_text)} 字符)")
+                                if func_name == "open_app":
+                                    target_app = func_args.get("name", "") or func_args.get("app", "")
+                                    target_bid = func_args.get("bundle_id", "")
+                                    raw_text = launch_mac_app(target_app, target_bid)
+                                    cost_ms = int((time.time() - t_start) * 1000)
+                                    res_text = raw_text
+                                    log_event("MCP_RESULT", f"open_app ({cost_ms}ms) result: {res_text}")
+                                    print(f"✨ [启动应用完成] open_app ({cost_ms}ms, {res_text})")
+                                else:
+                                    mcp_res = await mcp_session.call_tool(func_name, func_args)
+                                    cost_ms = int((time.time() - t_start) * 1000)
+                                    texts = []
+                                    for item in mcp_res.content:
+                                        if hasattr(item, "text") and item.text:
+                                            texts.append(item.text)
+                                        elif hasattr(item, "data"):
+                                            texts.append("[截图像素数据已捕获]")
+                                    raw_text = "\n".join(texts) if texts else "ok"
+                                    
+                                    # 智能分发结果，防止非 AX 工具被 clean_ax_text 误清空
+                                    res_text = format_tool_result(func_name, raw_text)
+                                    log_event("MCP_RESULT", f"{func_name} ({cost_ms}ms) raw={len(raw_text)} chars, cleaned={len(res_text)} chars")
+                                    print(f"✨ [kimi-cu 完成] {func_name} ({cost_ms}ms, 内容: {res_text[:60].strip()})")
                             except Exception as err:
                                 res_text = f"Error: {err}"
                                 log_event("MCP_ERROR", f"{func_name} failed: {err}")
@@ -754,8 +852,29 @@ async def main():
                     for t in tools_resp.tools
                 ]
 
-                tool_names = [t.name for t in tools_resp.tools]
-                print(f"✅ 成功加载 {len(gemini_functions)} 个 kimi-cu 原生桌面控制工具:")
+                # 注入 macOS 原生极速应用启动与激活工具
+                open_app_tool = types.FunctionDeclaration(
+                    name="open_app",
+                    description="在 macOS 上启动或前台激活任何应用程序（例如 计算器/Calculator, 备忘录/Notes, 音乐/Music, 微信/WeChat, Safari, Chrome, 日历/Calendar 等）。如果应用未运行会自动极速启动，若已在运行则直接置顶激活到前台。用户说'打开XXX'时优先使用此工具。",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "应用程序名称，支持中文或英文，例如 '计算器', 'Calculator', '备忘录', 'Notes', 'Safari', '微信', 'WeChat' 等"
+                            },
+                            "bundle_id": {
+                                "type": "string",
+                                "description": "可选。应用的 Bundle Identifier，例如 'com.apple.calculator', 'com.apple.Safari' 等"
+                            }
+                        },
+                        "required": ["name"]
+                    }
+                )
+                gemini_functions.append(open_app_tool)
+
+                tool_names = [t.name for t in gemini_functions]
+                print(f"✅ 成功加载 {len(gemini_functions)} 个 macOS 原生桌面控制工具:")
                 print("   " + ", ".join(tool_names))
                 print(f"\n[2/3] 正在建立 Gemini Live 全双工连接 ({selected_model})...")
                 print(f"[3/3] 🟢 实时语音管家已就绪！")
