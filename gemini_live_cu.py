@@ -33,7 +33,8 @@ from tool_policy import (
     ToolPolicyManager,
     ToolResultContract,
     CancellationToken,
-    PolicyLevel
+    PolicyLevel,
+    is_browser_error
 )
 from ego_browser_client import (
     browser_open,
@@ -447,9 +448,9 @@ def find_audio_devices(preferred_mic="Wireless Mic Rx"):
 
 class SmoothAudioPlayer:
     """带 Jitter Buffer 预缓冲平滑输出的音频播放器，彻底消除顿挫与断续"""
-    def __init__(self, sample_rate=SPK_RATE):
+    def __init__(self, sample_rate=SPK_RATE, max_queue_size=150):
         self.sample_rate = sample_rate
-        self.queue = queue.Queue()
+        self.queue = queue.Queue(maxsize=max_queue_size)
         self.running = True
         self.is_playing = False
         self.thread = threading.Thread(target=self._worker, daemon=True)
@@ -504,7 +505,18 @@ class SmoothAudioPlayer:
 
     def write(self, data: bytes):
         if self.running and data:
-            self.queue.put(data)
+            try:
+                self.queue.put_nowait(data)
+            except queue.Full:
+                # 队列溢出时主动丢弃最老一帧，吸收积压
+                try:
+                    self.queue.get_nowait()
+                except Exception:
+                    pass
+                try:
+                    self.queue.put_nowait(data)
+                except Exception:
+                    pass
 
     def is_busy(self):
         return self.is_playing or not self.queue.empty()
@@ -520,7 +532,10 @@ class SmoothAudioPlayer:
 
     def stop(self):
         self.running = False
-        self.queue.put(None)
+        try:
+            self.queue.put_nowait(None)
+        except Exception:
+            pass
         self.thread.join(timeout=0.5)
 
 
@@ -537,21 +552,36 @@ async def run_session(
     shutdown_event,
     memory: ConversationMemory,
     user_threshold=None,
-    strict_policy=True
+    strict_policy=True,
+    session_state=None
 ):
     """
     单个全双工实时会话生命周期
-    - 维持常驻 WebSocket 连接，杜绝单轮断连与上下文丢失
-    - 本地对话记忆池 (ConversationMemory) 支持多轮累积与断线无缝回灌
+    - 维持常驻 WebSocket 连接，采用官方公开 session.receive() 与 session_resumption
+    - HybridVAD 模式：连续流式 send_realtime_input + 本地近场门控 + audio_stream_end
+    - 本地对话记忆池 (ConversationMemory) 支持多轮累积与断线回灌
     - 带 CancellationToken 的可取消多步执行与全链路打断
-    - 安全执行层 (Tool Policy) 策略审查与结构化结果契约
+    - 安全执行层 (Tool Policy) 策略审查、调用预算、去重拦截与结构化结果契约
     """
     client = genai.Client(api_key=api_key)
     policy_manager = ToolPolicyManager(strict_mode=strict_policy)
 
+    if session_state is None:
+        session_state = {"handle": None}
+
     thinking_config = None
     if "thinking" in selected_model:
         thinking_config = types.ThinkingConfig(include_thoughts=True)
+
+    last_resumption_handle = session_state.get("handle")
+    session_resumption_cfg = (
+        types.SessionResumptionConfig(handle=last_resumption_handle)
+        if last_resumption_handle
+        else types.SessionResumptionConfig()
+    )
+    context_compression_cfg = types.ContextWindowCompressionConfig(
+        sliding_window=types.SlidingWindow(target_tokens=4000)
+    )
 
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
@@ -568,14 +598,17 @@ async def run_session(
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
         thinking_config=thinking_config,
-        tools=[types.Tool(function_declarations=gemini_functions)]
+        tools=[types.Tool(function_declarations=gemini_functions)],
+        session_resumption=session_resumption_cfg,
+        context_window_compression=context_compression_cfg,
     )
 
     state = STATE_LISTENING
     state_start_time = time.time()
     loop = asyncio.get_running_loop()
 
-    turn_queue = asyncio.Queue()
+    audio_stream_queue = asyncio.Queue(maxsize=250)
+    AUDIO_STREAM_END = b"__AUDIO_STREAM_END__"
     reconnect_event = asyncio.Event()
 
     # 近场降噪门限参数 (初始基准值，稍后自适应对齐)
@@ -585,9 +618,7 @@ async def run_session(
     SILENCE_CHUNKS = 10
     INTERRUPT_RMS = 220
     MIN_PEAK_RMS = 95
-    MIN_DURATION = 0.35
 
-    audio_buffer = []
     pre_roll = collections.deque(maxlen=4)
     is_speaking = False
     attack_count = 0
@@ -598,6 +629,7 @@ async def run_session(
     waiting_tool_summary = False
     is_interrupted = False
     calib_samples = []
+    last_cli_print_time = 0.0
 
     active_cancellation_token = CancellationToken("turn_init")
 
@@ -609,10 +641,30 @@ async def run_session(
             interrupt_frames = 0
             log_event("STATE", f"Transitioned to {new_state}")
 
+    def safe_put_audio(chunk_bytes):
+        try:
+            audio_stream_queue.put_nowait(chunk_bytes)
+        except asyncio.QueueFull:
+            try:
+                audio_stream_queue.get_nowait()
+            except Exception:
+                pass
+            try:
+                audio_stream_queue.put_nowait(chunk_bytes)
+            except Exception:
+                pass
+
+    def drain_audio_queue():
+        while not audio_stream_queue.empty():
+            try:
+                audio_stream_queue.get_nowait()
+            except Exception:
+                break
+
     def mic_callback(indata, frames, time_info, status):
         nonlocal is_speaking, attack_count, silence_count, state, interrupt_frames
         nonlocal START_THRESHOLD, HOLD_THRESHOLD, MIN_PEAK_RMS, INTERRUPT_RMS, is_interrupted, active_cancellation_token
-        nonlocal audio_buffer
+        nonlocal last_cli_print_time
 
         if mic_channels == 2:
             stereo = np.frombuffer(indata, dtype=np.int16).reshape(-1, 2)
@@ -639,6 +691,8 @@ async def run_session(
             calib_samples.append(rms)
             return
 
+        now = time.time()
+        should_print_cli = (now - last_cli_print_time >= 0.1)
         bars = "▇" * min(12, rms // 30) + "░" * max(0, 12 - rms // 30)
 
         # 1. 扬声器播报中：检测打断
@@ -649,18 +703,22 @@ async def run_session(
                     is_interrupted = True
                     active_cancellation_token.cancel("User interrupted during speaking")
                     player.interrupt()
+                    loop.call_soon_threadsafe(drain_audio_queue)
                     set_state(STATE_LISTENING)
                     is_speaking = True
                     attack_count = 0
                     silence_count = 0
-                    audio_buffer = [raw_bytes]
+                    loop.call_soon_threadsafe(safe_put_audio, raw_bytes)
                     log_event("USER_INTERRUPT", f"User interrupted speaking (rms={rms})")
                     sys.stdout.write(f"\r🛑 [\033[1;31m已打断播报，请继续说...\033[0m]                           \n")
                     sys.stdout.flush()
+                    last_cli_print_time = now
             else:
                 interrupt_frames = 0
-            sys.stdout.write(f"\r🗣️ [\033[1;35mGemini 正在播报...\033[0m] 音量: |{bars}| ({rms:3d}) ")
-            sys.stdout.flush()
+            if should_print_cli:
+                sys.stdout.write(f"\r🗣️ [\033[1;35mGemini 正在播报...\033[0m] 音量: |{bars}| ({rms:3d}) ")
+                sys.stdout.flush()
+                last_cli_print_time = now
             return
 
         # 2. kimi-cu 正在执行动作：检测到强力打断停止后续动作
@@ -671,18 +729,22 @@ async def run_session(
                     is_interrupted = True
                     active_cancellation_token.cancel("User voice interrupt during tool execution")
                     player.interrupt()
+                    loop.call_soon_threadsafe(drain_audio_queue)
                     set_state(STATE_LISTENING)
                     is_speaking = True
                     attack_count = 0
                     silence_count = 0
-                    audio_buffer = [raw_bytes]
+                    loop.call_soon_threadsafe(safe_put_audio, raw_bytes)
                     log_event("USER_INTERRUPT", f"User interrupted executing state (rms={rms})")
                     sys.stdout.write(f"\r🛑 [\033[1;31m已打断动作执行，请继续说...\033[0m]                           \n")
                     sys.stdout.flush()
+                    last_cli_print_time = now
             else:
                 interrupt_frames = 0
-            sys.stdout.write(f"\r⚙️ [\033[1;33mkimi-cu 正在执行桌面动作...\033[0m] 音量: |{bars}| ({rms:3d}) ")
-            sys.stdout.flush()
+            if should_print_cli:
+                sys.stdout.write(f"\r⚙️ [\033[1;33mkimi-cu 正在执行桌面动作...\033[0m] 音量: |{bars}| ({rms:3d}) ")
+                sys.stdout.flush()
+                last_cli_print_time = now
             return
 
         # 3. 正在思考中
@@ -693,80 +755,88 @@ async def run_session(
                     is_interrupted = True
                     active_cancellation_token.cancel("User voice interrupt during thinking")
                     player.interrupt()
+                    loop.call_soon_threadsafe(drain_audio_queue)
                     set_state(STATE_LISTENING)
                     is_speaking = True
                     attack_count = 0
                     silence_count = 0
-                    audio_buffer = [raw_bytes]
+                    loop.call_soon_threadsafe(safe_put_audio, raw_bytes)
                     log_event("USER_INTERRUPT", f"User interrupted thinking state (rms={rms})")
                     sys.stdout.write(f"\r🛑 [\033[1;31m已取消等待，请重新说...\033[0m]                           \n")
                     sys.stdout.flush()
+                    last_cli_print_time = now
             else:
                 interrupt_frames = 0
-            sys.stdout.write(f"\r🧠 [\033[1;36mGemini 正在处理中...\033[0m] 音量: |{bars}| ({rms:3d}) ")
-            sys.stdout.flush()
+            if should_print_cli:
+                sys.stdout.write(f"\r🧠 [\033[1;36mGemini 正在处理中...\033[0m] 音量: |{bars}| ({rms:3d}) ")
+                sys.stdout.flush()
+                last_cli_print_time = now
             return
 
-        # 4. 空闲监听中
+        # 4. 空闲监听中 (HybridVAD 连续流式输入)
         if not is_speaking:
             if rms >= START_THRESHOLD:
                 attack_count += 1
                 pre_roll.append(raw_bytes)
-                sys.stdout.write(f"\r🎤 [\033[1;33m检测到声音 {attack_count}/{ATTACK_FRAMES}\033[0m] 音量: |{bars}| ({rms:3d}/{START_THRESHOLD}) ")
-                sys.stdout.flush()
+                if should_print_cli or attack_count == 1:
+                    sys.stdout.write(f"\r🎤 [\033[1;33m检测到声音 {attack_count}/{ATTACK_FRAMES}\033[0m] 音量: |{bars}| ({rms:3d}/{START_THRESHOLD}) ")
+                    sys.stdout.flush()
+                    last_cli_print_time = now
 
                 if attack_count >= ATTACK_FRAMES:
                     is_speaking = True
                     silence_count = 0
                     attack_count = 0
                     active_cancellation_token = CancellationToken(f"turn_{time.time()}")
-                    audio_buffer = list(pre_roll)
+                    for pr_chunk in pre_roll:
+                        loop.call_soon_threadsafe(safe_put_audio, pr_chunk)
                     pre_roll.clear()
-                    log_event("USER_SPEECH_START", f"Speech started (rms={rms})")
+                    log_event("USER_SPEECH_START", f"Streaming speech started (rms={rms})")
             else:
                 attack_count = 0
                 pre_roll.append(raw_bytes)
-                if rms >= max(35, int(START_THRESHOLD * 0.55)):
-                    sys.stdout.write(f"\r🎤 [\033[93m收音中\033[0m] 音量: |{bars}| ({rms:3d}/{START_THRESHOLD}) ")
-                else:
-                    sys.stdout.write(f"\r🎤 [\033[90m监听中\033[0m] 音量: |{bars}| ({rms:3d}/{START_THRESHOLD}) ")
-                sys.stdout.flush()
+                if should_print_cli:
+                    if rms >= max(35, int(START_THRESHOLD * 0.55)):
+                        sys.stdout.write(f"\r🎤 [\033[93m收音中\033[0m] 音量: |{bars}| ({rms:3d}/{START_THRESHOLD}) ")
+                    else:
+                        sys.stdout.write(f"\r🎤 [\033[90m监听中\033[0m] 音量: |{bars}| ({rms:3d}/{START_THRESHOLD}) ")
+                    sys.stdout.flush()
+                    last_cli_print_time = now
         else:
-            audio_buffer.append(raw_bytes)
+            # 持续流式推送 PCM 块
+            loop.call_soon_threadsafe(safe_put_audio, raw_bytes)
             if rms >= HOLD_THRESHOLD:
                 silence_count = 0
-                sys.stdout.write(f"\r🎤 [\033[1;32m正在录制语音\033[0m] 音量: |{bars}| ({rms:3d}) ")
-                sys.stdout.flush()
+                if should_print_cli:
+                    sys.stdout.write(f"\r🎤 [\033[1;32m正在流式说话\033[0m] 音量: |{bars}| ({rms:3d}) ")
+                    sys.stdout.flush()
+                    last_cli_print_time = now
             else:
                 silence_count += 1
-                sys.stdout.write(f"\r🎤 [\033[1;36m检测停顿 {silence_count}/{SILENCE_CHUNKS}\033[0m] 音量: |{bars}| ({rms:3d}) ")
-                sys.stdout.flush()
+                if should_print_cli:
+                    sys.stdout.write(f"\r🎤 [\033[1;36m检测停顿 {silence_count}/{SILENCE_CHUNKS}\033[0m] 音量: |{bars}| ({rms:3d}) ")
+                    sys.stdout.flush()
+                    last_cli_print_time = now
 
                 if silence_count >= SILENCE_CHUNKS:
                     is_speaking = False
                     silence_count = 0
                     attack_count = 0
-                    full_turn = b"".join(audio_buffer)
-                    dur_sec = len(full_turn) / (MIC_RATE * 2)
-                    audio_buffer = []
-
-                    if dur_sec < MIN_DURATION:
-                        log_event("NOISE_REJECTED", f"dur={dur_sec:.2f}s < {MIN_DURATION}s")
-                        return
-
+                    # 发送音频流结束标记，通知 Gemini 即刻开始响应
+                    loop.call_soon_threadsafe(safe_put_audio, AUDIO_STREAM_END)
                     set_state(STATE_THINKING)
-                    log_event("USER_SPEECH_SENT", f"Turn audio of {dur_sec:.2f}s sending to Gemini")
-                    sys.stdout.write(f"\r⚡ [\033[1;33m正在发送语音至 Gemini Live...\033[0m]                       \n")
+                    log_event("USER_SPEECH_END", "Speech ended, queued AUDIO_STREAM_END")
+                    sys.stdout.write(f"\r⚡ [\033[1;33m语音已结束，Gemini 实时响应中...\033[0m]                       \n")
                     sys.stdout.flush()
-                    loop.call_soon_threadsafe(turn_queue.put_nowait, full_turn)
+                    last_cli_print_time = now
 
     # 建立全双工连接（常驻连接）
     async with client.aio.live.connect(model=selected_model, config=config) as session:
         log_event("SESSION", f"Gemini Live session connected ({selected_model})")
 
-        # 核心：如果已有上下文记忆，瞬间自动回灌，彻底杜绝断线失忆！
+        # 核心：如果已有上下文记忆且未由 handle 自动恢复，自动回灌前序轮次
         prefill_turns = memory.get_prefill_turns()
-        if prefill_turns:
+        if prefill_turns and not last_resumption_handle:
             try:
                 await session.send_client_content(turns=prefill_turns, turn_complete=False)
                 log_event("MEMORY_INJECTED", f"Successfully prefilled {len(prefill_turns)} history turns into session")
@@ -774,6 +844,10 @@ async def run_session(
                 sys.stdout.flush()
             except Exception as e:
                 log_event("MEMORY_INJECT_FAIL", f"Failed to prefill history: {e}")
+        elif last_resumption_handle:
+            log_event("SESSION_RESUMED", f"Resumed session with handle {last_resumption_handle[:16]}...")
+            sys.stdout.write(f"\r⚡ [\033[1;36m已通过官方 Handle 无缝恢复 Live 会话\033[0m]                       \n")
+            sys.stdout.flush()
 
         mic_stream = sd.RawInputStream(
             samplerate=MIC_RATE,
@@ -816,34 +890,30 @@ async def run_session(
                         reconnect_event.set()
                         break
 
-        # 音频发送循环
+        # 音频流发送循环 (HybridVAD 模式)
         async def send_loop():
             try:
                 while not shutdown_event.is_set() and not reconnect_event.is_set():
-                    pcm_turn = await turn_queue.get()
-                    if pcm_turn is None:
+                    item = await audio_stream_queue.get()
+                    if item is None:
                         break
-                    await session.send_client_content(
-                        turns=[
-                            types.Content(
-                                role="user",
-                                parts=[
-                                    types.Part.from_bytes(
-                                        data=pcm_turn,
-                                        mime_type="audio/pcm;rate=16000"
-                                    )
-                                ]
+                    if item == AUDIO_STREAM_END:
+                        await session.send_realtime_input(audio_stream_end=True)
+                        log_event("SEND_AUDIO_STREAM_END", "Sent audio_stream_end=True to Gemini")
+                    else:
+                        await session.send_realtime_input(
+                            audio=types.Blob(
+                                data=item,
+                                mime_type="audio/pcm;rate=16000"
                             )
-                        ],
-                        turn_complete=True
-                    )
+                        )
             except asyncio.CancelledError:
                 pass
             except Exception as e:
                 log_event("SEND_ERROR", str(e))
                 reconnect_event.set()
 
-        # 接收循环：常驻监听，跨轮次永不退出的长连接
+        # 接收循环：常驻监听，使用公开 session.receive() 迭代器
         async def recv_loop():
             nonlocal state, has_active_tool, waiting_tool_summary, is_interrupted, active_cancellation_token
             current_user_transcript = []
@@ -852,253 +922,285 @@ async def run_session(
 
             try:
                 while not shutdown_event.is_set() and not reconnect_event.is_set():
-                    response = await session._receive()
-                    if not response:
-                        log_event("SESSION", "Server closed connection")
-                        reconnect_event.set()
-                        break
+                    policy_manager.reset_turn()
+                    messages_in_turn = 0
 
-                    # 0. 检查服务端下发的工具取消信号
-                    if getattr(response, "tool_call_cancellation", None) and response.tool_call_cancellation.ids:
-                        cancelled_ids = set(response.tool_call_cancellation.ids)
-                        log_event("SERVER_TOOL_CANCEL", f"Server cancelled tool call IDs: {cancelled_ids}")
-                        active_cancellation_token.cancel("Server cancelled tool call")
-                        has_active_tool = False
-                        waiting_tool_summary = False
+                    async for response in session.receive():
+                        messages_in_turn += 1
+                        if shutdown_event.is_set() or reconnect_event.is_set():
+                            break
 
-                    # 1. 检查服务端打断信号
-                    if response.server_content and response.server_content.interrupted:
-                        player.interrupt()
-                        active_cancellation_token.cancel("Server reported interrupted")
-                        set_state(STATE_LISTENING)
-                        has_active_tool = False
-                        waiting_tool_summary = False
-                        is_interrupted = False
-                        log_event("SERVER_INTERRUPT", "Server reported interrupted")
+                        # 0. 检查官方会话恢复句柄更新 (Session Resumption Update)
+                        if getattr(response, "session_resumption_update", None):
+                            upd = response.session_resumption_update
+                            if upd.resumable and upd.new_handle:
+                                session_state["handle"] = upd.new_handle
+                                log_event("RESUMPTION_HANDLE", f"Updated resumption handle: {upd.new_handle[:16]}...")
 
-                    # 1.5 语音实时转录展示与收集
-                    if response.server_content:
-                        if response.server_content.input_transcription and response.server_content.input_transcription.text:
-                            txt = response.server_content.input_transcription.text.strip()
-                            if txt:
-                                current_user_transcript.append(txt)
-                                log_event("USER_TRANSCRIPT", txt)
-                                sys.stdout.write(f"\n👤 [\033[1;32m用户语音转录\033[0m] {txt}\n")
-                                sys.stdout.flush()
-                        if response.server_content.output_transcription and response.server_content.output_transcription.text:
-                            txt = response.server_content.output_transcription.text.strip()
-                            if txt:
-                                current_model_transcript.append(txt)
-                                log_event("MODEL_TRANSCRIPT", txt)
-                                sys.stdout.write(f"\n🤖 [\033[1;36mGemini 播报转录\033[0m] {txt}\n")
-                                sys.stdout.flush()
+                        # 0.1 检查服务端 GoAway 通知 (平滑重连)
+                        if getattr(response, "go_away", None):
+                            log_event("SERVER_GO_AWAY", "Server issued GoAway signal, graceful reconnect triggered")
+                            reconnect_event.set()
+                            break
 
-                    # 2. 模型回复内容（思考、文本与音频）
-                    if response.server_content and response.server_content.model_turn:
-                        waiting_tool_summary = False
-                        for part in response.server_content.model_turn.parts:
-                            if part.text:
-                                if getattr(part, "thought", False):
-                                    log_event("MODEL_THOUGHT", part.text.strip())
-                                    sys.stdout.write(f"\033[90m💭 {part.text}\033[0m")
-                                else:
-                                    current_model_transcript.append(part.text)
-                                    log_event("MODEL_TEXT", part.text.strip())
-                                    sys.stdout.write(part.text)
-                                sys.stdout.flush()
-                            if part.inline_data:
-                                if is_interrupted or active_cancellation_token.is_cancelled:
+                        # 0.2 检查服务端下发的工具取消信号
+                        if getattr(response, "tool_call_cancellation", None) and response.tool_call_cancellation.ids:
+                            cancelled_ids = set(response.tool_call_cancellation.ids)
+                            log_event("SERVER_TOOL_CANCEL", f"Server cancelled tool call IDs: {cancelled_ids}")
+                            active_cancellation_token.cancel("Server cancelled tool call")
+                            has_active_tool = False
+                            waiting_tool_summary = False
+
+                        # 1. 检查服务端打断信号
+                        if response.server_content and response.server_content.interrupted:
+                            player.interrupt()
+                            active_cancellation_token.cancel("Server reported interrupted")
+                            set_state(STATE_LISTENING)
+                            has_active_tool = False
+                            waiting_tool_summary = False
+                            is_interrupted = False
+                            log_event("SERVER_INTERRUPT", "Server reported interrupted")
+
+                        # 1.5 语音实时转录展示与收集
+                        if response.server_content:
+                            if response.server_content.input_transcription and response.server_content.input_transcription.text:
+                                txt = response.server_content.input_transcription.text.strip()
+                                if txt:
+                                    current_user_transcript.append(txt)
+                                    log_event("USER_TRANSCRIPT", txt)
+                                    sys.stdout.write(f"\n👤 [\033[1;32m用户语音转录\033[0m] {txt}\n")
+                                    sys.stdout.flush()
+                            if response.server_content.output_transcription and response.server_content.output_transcription.text:
+                                txt = response.server_content.output_transcription.text.strip()
+                                if txt:
+                                    current_model_transcript.append(txt)
+                                    log_event("MODEL_TRANSCRIPT", txt)
+                                    sys.stdout.write(f"\n🤖 [\033[1;36mGemini 播报转录\033[0m] {txt}\n")
+                                    sys.stdout.flush()
+
+                        # 2. 模型回复内容（思考、文本与音频）
+                        if response.server_content and response.server_content.model_turn:
+                            waiting_tool_summary = False
+                            for part in response.server_content.model_turn.parts:
+                                if part.text:
+                                    if getattr(part, "thought", False):
+                                        log_event("MODEL_THOUGHT", part.text.strip())
+                                        sys.stdout.write(f"\033[90m💭 {part.text}\033[0m")
+                                    else:
+                                        current_model_transcript.append(part.text)
+                                        log_event("MODEL_TEXT", part.text.strip())
+                                        sys.stdout.write(part.text)
+                                    sys.stdout.flush()
+                                if part.inline_data:
+                                    if is_interrupted or active_cancellation_token.is_cancelled:
+                                        continue
+                                    set_state(STATE_SPEAKING)
+                                    player.write(part.inline_data.data)
+
+                        # 3. 工具调用请求（接入 ToolPolicyManager、去重与结构化结果契约）
+                        if response.tool_call:
+                            has_active_tool = True
+                            waiting_tool_summary = False
+                            set_state(STATE_EXECUTING)
+                            function_responses = []
+
+                            for call in response.tool_call.function_calls:
+                                func_name = call.name
+                                func_args = call.args or {}
+
+                                allowed, policy_contract = policy_manager.check_execution(
+                                    func_name, func_args, cancellation_token=active_cancellation_token
+                                )
+
+                                if not allowed:
+                                    log_event("POLICY_BLOCK", f"Tool {func_name} blocked: {policy_contract.summary}")
+                                    print(f"\n🛡️  [安全策略拦截] \033[1;31m{func_name}\033[0m: {policy_contract.summary}")
+                                    function_responses.append(
+                                        types.FunctionResponse(
+                                            name=func_name,
+                                            id=call.id,
+                                            response={"result": policy_contract.to_gemini_response()}
+                                        )
+                                    )
                                     continue
-                                set_state(STATE_SPEAKING)
-                                player.write(part.inline_data.data)
 
-                    # 3. 工具调用请求（接入 ToolPolicyManager 与结构化结果契约）
-                    if response.tool_call:
-                        has_active_tool = True
-                        waiting_tool_summary = False
-                        set_state(STATE_EXECUTING)
-                        function_responses = []
+                                log_event("TOOL_CALL", f"Calling {func_name} with args: {func_args}")
+                                print(f"\n🛠️  [执行动作] \033[1;33m{func_name}\033[0m({func_args})")
 
-                        for call in response.tool_call.function_calls:
-                            func_name = call.name
-                            func_args = call.args or {}
+                                if func_name in ["press_key", "type_text", "click"]:
+                                    if not func_args.get("app") and not func_args.get("pid"):
+                                        func_args["app"] = "com.apple.finder"
 
-                            allowed, policy_contract = policy_manager.check_execution(
-                                func_name, func_args, cancellation_token=active_cancellation_token
-                            )
+                                if func_name in ["press_key", "type_text"]:
+                                    func_args.setdefault("activate", True)
+                                elif func_name == "get_app_state":
+                                    func_args.setdefault("mode", "ax")
 
-                            if not allowed:
-                                log_event("POLICY_BLOCK", f"Tool {func_name} blocked: {policy_contract.summary}")
-                                print(f"\n🛡️  [安全策略拦截] \033[1;31m{func_name}\033[0m: {policy_contract.summary}")
+                                t_start = time.time()
+                                try:
+                                    if func_name == "open_app":
+                                        target_app = func_args.get("name", "") or func_args.get("app", "")
+                                        target_bid = func_args.get("bundle_id", "")
+                                        raw_text = launch_mac_app(target_app, target_bid)
+                                        contract = ToolResultContract(
+                                            ok="成功" in raw_text,
+                                            action="open_app",
+                                            status="success" if "成功" in raw_text else "error",
+                                            summary=raw_text,
+                                            side_effects="app_launched"
+                                        )
+                                    elif func_name == "browser_open":
+                                        url = func_args.get("url", "") or func_args.get("url_or_kw", "")
+                                        res_text = await browser_open(url)
+                                        err = is_browser_error(res_text)
+                                        contract = ToolResultContract(
+                                            ok=not err,
+                                            action="browser_open",
+                                            status="success" if not err else "error",
+                                            summary="已打开网页" if not err else res_text[:60],
+                                            data=res_text,
+                                            side_effects="navigation" if not err else "none",
+                                            error=res_text if err else None
+                                        )
+                                    elif func_name == "browser_search":
+                                        query = func_args.get("query", "")
+                                        engine = func_args.get("engine", "baidu")
+                                        res_text = await browser_search(query, engine)
+                                        err = is_browser_error(res_text)
+                                        contract = ToolResultContract(
+                                            ok=not err,
+                                            action="browser_search",
+                                            status="success" if not err else "error",
+                                            summary=f"已搜索关键词 '{query}'" if not err else res_text[:60],
+                                            data=res_text,
+                                            side_effects="navigation" if not err else "none",
+                                            error=res_text if err else None
+                                        )
+                                    elif func_name == "browser_get_content":
+                                        res_text = await browser_get_content()
+                                        err = is_browser_error(res_text)
+                                        contract = ToolResultContract(
+                                            ok=not err,
+                                            action="browser_get_content",
+                                            status="success" if not err else "error",
+                                            summary="已提取页面内容" if not err else res_text[:60],
+                                            data=res_text,
+                                            error=res_text if err else None
+                                        )
+                                    elif func_name == "browser_list_actions":
+                                        max_items = func_args.get("max_items", 25)
+                                        res_text = await browser_list_actions(max_items=max_items)
+                                        err = is_browser_error(res_text)
+                                        contract = ToolResultContract(
+                                            ok=not err,
+                                            action="browser_list_actions",
+                                            status="success" if not err else "error",
+                                            summary="已获取页面可操作候选项" if not err else res_text[:60],
+                                            data=res_text,
+                                            error=res_text if err else None
+                                        )
+                                    elif func_name == "browser_click":
+                                        target = func_args.get("text", "") or func_args.get("text_or_selector", "") or func_args.get("target", "")
+                                        res_text = await browser_click(target)
+                                        err = is_browser_error(res_text) or ("已成功点击" not in res_text)
+                                        contract = ToolResultContract(
+                                            ok=not err,
+                                            action="browser_click",
+                                            status="success" if not err else "error",
+                                            summary=res_text[:80],
+                                            side_effects="ui_updated" if not err else "none",
+                                            error=res_text if err else None
+                                        )
+                                    elif func_name == "browser_scroll":
+                                        direction = func_args.get("direction", "down")
+                                        res_text = await browser_scroll(direction)
+                                        err = is_browser_error(res_text)
+                                        contract = ToolResultContract(
+                                            ok=not err,
+                                            action="browser_scroll",
+                                            status="success" if not err else "error",
+                                            summary=res_text[:80],
+                                            side_effects="ui_updated" if not err else "none",
+                                            error=res_text if err else None
+                                        )
+                                    else:
+                                        mcp_res = await mcp_session.call_tool(func_name, func_args)
+                                        is_err = bool(getattr(mcp_res, "is_error", False) or getattr(mcp_res, "isError", False))
+                                        texts = []
+                                        for item in mcp_res.content:
+                                            if hasattr(item, "text") and item.text:
+                                                texts.append(item.text)
+                                            elif hasattr(item, "data"):
+                                                texts.append("[截图像素数据已捕获]")
+                                        raw_text = "\n".join(texts) if texts else ("MCP 执行失败" if is_err else "ok")
+                                        cleaned_text = format_tool_result(func_name, raw_text)
+                                        contract = ToolResultContract(
+                                            ok=not is_err,
+                                            action=func_name,
+                                            status="success" if not is_err else "error",
+                                            summary=f"已执行 {func_name}" if not is_err else f"{func_name} 执行失败",
+                                            data=cleaned_text,
+                                            side_effects="ui_updated" if not is_err else "none",
+                                            error=cleaned_text if is_err else None
+                                        )
+                                except Exception as err:
+                                    contract = ToolResultContract(
+                                        ok=False,
+                                        action=func_name,
+                                        status="error",
+                                        summary="执行异常",
+                                        error=str(err)
+                                    )
+
+                                cost_ms = int((time.time() - t_start) * 1000)
+                                log_event("TOOL_RESULT", f"{func_name} ({cost_ms}ms) status={contract.status}")
+                                print(f"✨ [{func_name} 完成] ({cost_ms}ms, {contract.summary[:60]})")
+                                current_tools_executed.append(f"{func_name}: {contract.summary[:60]}")
+
                                 function_responses.append(
                                     types.FunctionResponse(
                                         name=func_name,
                                         id=call.id,
-                                        response={"result": policy_contract.to_gemini_response()}
+                                        response={"result": contract.to_gemini_response()}
                                     )
                                 )
-                                continue
 
-                            log_event("TOOL_CALL", f"Calling {func_name} with args: {func_args}")
-                            print(f"\n🛠️  [执行动作] \033[1;33m{func_name}\033[0m({func_args})")
+                            await session.send_tool_response(function_responses=function_responses)
+                            log_event("TOOL_RESPONSE_SENT", f"Sent response for {len(function_responses)} calls, waiting for Gemini summary")
+                            has_active_tool = False
+                            waiting_tool_summary = True
+                            set_state(STATE_THINKING)
 
-                            if func_name in ["press_key", "type_text", "click"]:
-                                if not func_args.get("app") and not func_args.get("pid"):
-                                    func_args["app"] = "com.apple.finder"
+                        # 4. 轮次终结：沉淀记忆至本地记忆池，平滑回归 LISTENING
+                        if response.server_content and response.server_content.turn_complete:
+                            if not response.tool_call and not has_active_tool and not waiting_tool_summary:
+                                u_txt = " ".join(current_user_transcript).strip()
+                                m_txt = "".join(current_model_transcript).strip()
+                                t_summary = "; ".join(current_tools_executed).strip()
+                                if u_txt or m_txt or t_summary:
+                                    memory.record_turn(user_text=u_txt, model_text=m_txt, tool_summary=t_summary)
+                                    log_event("MEMORY_RECORDED", f"Memory updated (user='{u_txt[:30]}', model='{m_txt[:30]}', tools='{t_summary[:40]}')")
 
-                            if func_name in ["press_key", "type_text"]:
-                                func_args.setdefault("activate", True)
-                            elif func_name == "get_app_state":
-                                func_args.setdefault("mode", "ax")
+                                current_user_transcript = []
+                                current_model_transcript = []
+                                current_tools_executed = []
 
-                            t_start = time.time()
-                            try:
-                                if func_name == "open_app":
-                                    target_app = func_args.get("name", "") or func_args.get("app", "")
-                                    target_bid = func_args.get("bundle_id", "")
-                                    raw_text = launch_mac_app(target_app, target_bid)
-                                    contract = ToolResultContract(
-                                        ok="成功" in raw_text,
-                                        action="open_app",
-                                        status="success" if "成功" in raw_text else "error",
-                                        summary=raw_text,
-                                        side_effects="app_launched"
-                                    )
-                                elif func_name == "browser_open":
-                                    url = func_args.get("url", "") or func_args.get("url_or_kw", "")
-                                    res_text = await browser_open(url)
-                                    contract = ToolResultContract(
-                                        ok="失败" not in res_text,
-                                        action="browser_open",
-                                        status="success" if "失败" not in res_text else "error",
-                                        summary="已打开网页" if "失败" not in res_text else "打开网页失败",
-                                        data=res_text,
-                                        side_effects="navigation"
-                                    )
-                                elif func_name == "browser_search":
-                                    query = func_args.get("query", "")
-                                    engine = func_args.get("engine", "baidu")
-                                    res_text = await browser_search(query, engine)
-                                    contract = ToolResultContract(
-                                        ok="失败" not in res_text,
-                                        action="browser_search",
-                                        status="success" if "失败" not in res_text else "error",
-                                        summary=f"已搜索关键词 '{query}'",
-                                        data=res_text,
-                                        side_effects="navigation"
-                                    )
-                                elif func_name == "browser_get_content":
-                                    res_text = await browser_get_content()
-                                    contract = ToolResultContract(
-                                        ok="失败" not in res_text,
-                                        action="browser_get_content",
-                                        status="success" if "失败" not in res_text else "error",
-                                        summary="已提取页面内容",
-                                        data=res_text
-                                    )
-                                elif func_name == "browser_list_actions":
-                                    max_items = func_args.get("max_items", 25)
-                                    res_text = await browser_list_actions(max_items=max_items)
-                                    contract = ToolResultContract(
-                                        ok="失败" not in res_text,
-                                        action="browser_list_actions",
-                                        status="success" if "失败" not in res_text else "error",
-                                        summary="已获取页面可操作候选项",
-                                        data=res_text
-                                    )
-                                elif func_name == "browser_click":
-                                    target = func_args.get("text", "") or func_args.get("text_or_selector", "") or func_args.get("target", "")
-                                    res_text = await browser_click(target)
-                                    contract = ToolResultContract(
-                                        ok="已成功点击" in res_text,
-                                        action="browser_click",
-                                        status="success" if "已成功点击" in res_text else "error",
-                                        summary=res_text,
-                                        side_effects="ui_updated"
-                                    )
-                                elif func_name == "browser_scroll":
-                                    direction = func_args.get("direction", "down")
-                                    res_text = await browser_scroll(direction)
-                                    contract = ToolResultContract(
-                                        ok="已向" in res_text,
-                                        action="browser_scroll",
-                                        status="success" if "已向" in res_text else "error",
-                                        summary=res_text,
-                                        side_effects="ui_updated"
-                                    )
-                                else:
-                                    mcp_res = await mcp_session.call_tool(func_name, func_args)
-                                    texts = []
-                                    for item in mcp_res.content:
-                                        if hasattr(item, "text") and item.text:
-                                            texts.append(item.text)
-                                        elif hasattr(item, "data"):
-                                            texts.append("[截图像素数据已捕获]")
-                                    raw_text = "\n".join(texts) if texts else "ok"
-                                    cleaned_text = format_tool_result(func_name, raw_text)
-                                    contract = ToolResultContract(
-                                        ok=True,
-                                        action=func_name,
-                                        status="success",
-                                        summary=f"已执行 {func_name}",
-                                        data=cleaned_text,
-                                        side_effects="ui_updated"
-                                    )
-                            except Exception as err:
-                                contract = ToolResultContract(
-                                    ok=False,
-                                    action=func_name,
-                                    status="error",
-                                    summary=f"执行异常",
-                                    error=str(err)
-                                )
+                                async def wait_for_playback_done():
+                                    wait_start = time.time()
+                                    while player.is_busy() and (time.time() - wait_start < 15.0):
+                                        await asyncio.sleep(0.05)
+                                    await asyncio.sleep(0.1)
+                                    set_state(STATE_LISTENING)
+                                    is_interrupted = False
+                                    active_cancellation_token = CancellationToken(f"turn_{time.time()}")
+                                    log_event("TURN_COMPLETE", "Turn fully finished and playback done, now LISTENING (Persistent session maintained)")
+                                    sys.stdout.write("\n🟢 [\033[1;32m就绪，请说下一句指令...\033[0m]\n")
+                                    sys.stdout.flush()
 
-                            cost_ms = int((time.time() - t_start) * 1000)
-                            log_event("TOOL_RESULT", f"{func_name} ({cost_ms}ms) status={contract.status}")
-                            print(f"✨ [{func_name} 完成] ({cost_ms}ms, {contract.summary[:60]})")
-                            current_tools_executed.append(f"{func_name}: {contract.summary[:60]}")
+                                asyncio.create_task(wait_for_playback_done())
 
-                            function_responses.append(
-                                types.FunctionResponse(
-                                    name=func_name,
-                                    id=call.id,
-                                    response={"result": contract.to_gemini_response()}
-                                )
-                            )
-
-                        await session.send_tool_response(function_responses=function_responses)
-                        log_event("TOOL_RESPONSE_SENT", f"Sent response for {len(function_responses)} calls, waiting for Gemini summary")
-                        has_active_tool = False
-                        waiting_tool_summary = True
-                        set_state(STATE_THINKING)
-
-                    # 4. 轮次终结：沉淀记忆至本地记忆池，平滑回归 LISTENING，长连接继续等待下一轮！
-                    if response.server_content and response.server_content.turn_complete:
-                        if not response.tool_call and not has_active_tool and not waiting_tool_summary:
-                            u_txt = " ".join(current_user_transcript).strip()
-                            m_txt = "".join(current_model_transcript).strip()
-                            t_summary = "; ".join(current_tools_executed).strip()
-                            if u_txt or m_txt or t_summary:
-                                memory.record_turn(user_text=u_txt, model_text=m_txt, tool_summary=t_summary)
-                                log_event("MEMORY_RECORDED", f"Memory updated (user='{u_txt[:30]}', model='{m_txt[:30]}', tools='{t_summary[:40]}')")
-
-                            current_user_transcript = []
-                            current_model_transcript = []
-                            current_tools_executed = []
-
-                            async def wait_for_playback_done():
-                                wait_start = time.time()
-                                while player.is_busy() and (time.time() - wait_start < 15.0):
-                                    await asyncio.sleep(0.05)
-                                await asyncio.sleep(0.1)
-                                set_state(STATE_LISTENING)
-                                is_interrupted = False
-                                active_cancellation_token = CancellationToken(f"turn_{time.time()}")
-                                log_event("TURN_COMPLETE", "Turn fully finished and playback done, now LISTENING (Persistent session maintained)")
-                                sys.stdout.write("\n🟢 [\033[1;32m就绪，请说下一句指令...\033[0m]\n")
-                                sys.stdout.flush()
-
-                            asyncio.create_task(wait_for_playback_done())
+                    if messages_in_turn == 0 and not shutdown_event.is_set() and not reconnect_event.is_set():
+                        await asyncio.sleep(0.05)
 
             except asyncio.CancelledError:
                 pass
@@ -1267,6 +1369,7 @@ async def main():
                 print(f"[3/3] 🟢 实时语音管家已就绪！")
                 print(f"💡 对着 \033[1;32m{mic_name}\033[0m 说话即可全双工实时交互。按 Ctrl+C 退出。\n" + "-" * 68)
 
+                session_state = {"handle": None}
                 retry_count = 0
                 while not shutdown_event.is_set():
                     try:
@@ -1283,7 +1386,8 @@ async def main():
                             shutdown_event=shutdown_event,
                             memory=conversation_memory,
                             user_threshold=args.threshold,
-                            strict_policy=not args.non_strict
+                            strict_policy=not args.non_strict,
+                            session_state=session_state
                         )
                         retry_count = 0
                     except asyncio.CancelledError:

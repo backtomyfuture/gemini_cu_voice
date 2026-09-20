@@ -49,7 +49,8 @@ from tool_policy import (
     ToolPolicyManager,
     ToolResultContract,
     CancellationToken,
-    PolicyLevel
+    PolicyLevel,
+    is_browser_error
 )
 from gemini_live_cu import (
     launch_mac_app,
@@ -239,6 +240,55 @@ def test_layer_0(report: TestReport):
     mem_ok = (len(turns) == 4 and turns[0].role == "user" and turns[1].role == "model" and turns[2].role == "user" and turns[3].role == "model")
     cost = (time.time() - t0) * 1000
     report.record("Layer 0", "状态记忆: ConversationMemory 多轮累积与预填契约", mem_ok, f"记录轮次: {len(turns)//2} 轮, Content数量: {len(turns)}", cost)
+
+    # 0.8 单轮工具调用预算超限拦截 (Tool Budget Limit)
+    t0 = time.time()
+    budget_mgr = ToolPolicyManager(strict_mode=True, max_tools_per_turn=3)
+    ok_1, _ = budget_mgr.check_execution("press_key", {"keys": "a"})
+    ok_2, _ = budget_mgr.check_execution("press_key", {"keys": "b"})
+    ok_3, _ = budget_mgr.check_execution("press_key", {"keys": "c"})
+    ok_4, contract_4 = budget_mgr.check_execution("press_key", {"keys": "d"})
+    budget_mgr.reset_turn()
+    ok_5, _ = budget_mgr.check_execution("press_key", {"keys": "e"})
+    budget_ok = ok_1 and ok_2 and ok_3 and (not ok_4) and contract_4.status == "denied" and ok_5
+    cost = (time.time() - t0) * 1000
+    report.record("Layer 0", "预算治理: 单轮工具调用预算超限拦截 (Turn Budget Gating)", budget_ok, f"超限拦截: {contract_4.summary}", cost)
+
+    # 0.9 重复动作防死循环去重阻断 (Duplicate Tool Call Suppression)
+    t0 = time.time()
+    dedup_mgr = ToolPolicyManager(strict_mode=True)
+    d_ok1, _ = dedup_mgr.check_execution("browser_search", {"query": "特斯拉最新动态"})
+    d_ok2, d_contract2 = dedup_mgr.check_execution("browser_search", {"query": "特斯拉最新动态"})
+    dedup_ok = d_ok1 and (not d_ok2) and d_contract2.status == "denied" and "重复调用" in d_contract2.summary
+    cost = (time.time() - t0) * 1000
+    report.record("Layer 0", "去重机制: 同轮次相同参数调用自动阻断 (Duplicate Tool Suppression)", dedup_ok, f"拦截提示: {d_contract2.summary}", cost)
+
+    # 0.10 浏览器正文含“失败”字符防误判 (Robust Browser Error Gating)
+    t0 = time.time()
+    article_content = "【页面标题】: 为什么很多科技创业项目会走向失败\n【URL】: https://news.example.com\n\n【提取正文要点】:\n失败是常态，复盘与坚持才是关键。"
+    real_failure = "【失败】 打开网页失败: 网址无法访问或网络不可达"
+    real_click_fail = "【失败】 点击失败: 未找到匹配元素"
+    gating_ok = (not is_browser_error(article_content)) and is_browser_error(real_failure) and is_browser_error(real_click_fail)
+    cost = (time.time() - t0) * 1000
+    report.record("Layer 0", "契约健壮: 网页正文含'失败'文本防误判 (Browser Error Gating)", gating_ok, "正文含'失败'正确放行，真实错误准确捕获", cost)
+
+    # 0.11 MCP is_error 异常标志状态映射 (MCP Structured Error Contract)
+    t0 = time.time()
+    class DummyMcpResult:
+        def __init__(self, is_error: bool, text: str):
+            self.is_error = is_error
+            self.content = [type("Item", (), {"text": text})]
+    mcp_fail = DummyMcpResult(is_error=True, text="Accessibility element [5] not found")
+    contract_mcp = ToolResultContract(
+        ok=not mcp_fail.is_error,
+        action="click",
+        status="error" if mcp_fail.is_error else "success",
+        summary="click 执行失败",
+        error="Accessibility element [5] not found"
+    )
+    mcp_contract_ok = (not contract_mcp.ok) and contract_mcp.status == "error" and "【未执行/失败】" in contract_mcp.to_gemini_response()
+    cost = (time.time() - t0) * 1000
+    report.record("Layer 0", "MCP 契约: is_error 异常标志准确映射为结构化失败 (MCP Error Flag Mapping)", mcp_contract_ok, f"响应输出: {contract_mcp.to_gemini_response()[:60]}", cost)
 
 
 # ==============================================================================

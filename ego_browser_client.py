@@ -40,10 +40,10 @@ async def run_ego_js(js_code: str, timeout: float = 12.0) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-        # 若未找到标准行，返回文本或报错
+        # 若未找到标准行，返回明确的错误，绝不隐式返回 ok: True
         if proc.returncode != 0:
             return {"ok": False, "error": combined.strip() or f"进程退出码: {proc.returncode}"}
-        return {"ok": True, "raw": combined.strip()[:1000]}
+        return {"ok": False, "error": f"浏览器未输出合法的 JSON 响应: {combined.strip()[:500]}"}
     except asyncio.TimeoutError:
         return {"ok": False, "error": f"浏览器操作超时 ({timeout}s)"}
     except Exception as e:
@@ -65,7 +65,9 @@ async def browser_open(url_or_kw: str, max_chars: int = 1200) -> str:
 
     safe_target = json.dumps(target)
     code = f"""const task = await taskSpace("voice assistant web");
-const page = task.page("p1");
+const tabs = await task.tabs();
+const activeTab = (tabs && tabs.length > 0) ? (tabs.find(t => t.active) || tabs[tabs.length - 1]) : null;
+const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
 const targetUrl = {safe_target};
 try {{
     await page.goto(targetUrl, {{ waitUntil: "domcontentloaded", timeout: 6500 }});
@@ -108,7 +110,7 @@ console.log(JSON.stringify({{ ok: true, title, url: currentUrl, text: cleanText 
         text = res.get("text", "")
         return f"【页面标题】: {title}\n【URL】: {url}\n\n【提取正文要点】:\n{text}"
     else:
-        return f"打开网页失败: {res.get('error', '未知错误')}"
+        return f"【失败】 打开网页失败: {res.get('error', '未知错误')}"
 
 
 async def browser_search(query: str, engine: str = "baidu", max_chars: int = 1200) -> str:
@@ -128,12 +130,12 @@ async def browser_search(query: str, engine: str = "baidu", max_chars: int = 120
 
 async def browser_get_content(max_chars: int = 1800) -> str:
     """
-    抓取当前 ego lite 前台最新页面的正文内容
+    抓取当前 ego lite 前台最新激活页面的正文内容
     """
     code = f"""const task = await taskSpace("voice assistant web");
 const tabs = await task.tabs();
-const targetTab = tabs[tabs.length - 1];
-const page = targetTab && targetTab.label ? task.page(targetTab.label) : task.page("p1");
+const activeTab = (tabs && tabs.length > 0) ? (tabs.find(t => t.active) || tabs[tabs.length - 1]) : null;
+const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
 
 const title = await page.title();
 const currentUrl = await page.url();
@@ -149,7 +151,7 @@ console.log(JSON.stringify({{ ok: true, title, url: currentUrl, text: text.slice
     res = await run_ego_js(code, timeout=8.0)
     if res.get("ok"):
         return f"【当前页面】: {res.get('title')}\n【URL】: {res.get('url')}\n\n【页面内容】:\n{res.get('text')}"
-    return f"获取页面内容失败: {res.get('error', '无法获取')}"
+    return f"【失败】 获取页面内容失败: {res.get('error', '无法获取')}"
 
 
 async def browser_list_actions(max_items: int = 25) -> str:
@@ -159,7 +161,7 @@ async def browser_list_actions(max_items: int = 25) -> str:
     """
     code = f"""const task = await taskSpace("voice assistant web");
 const tabs = await task.tabs();
-const activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
+const activeTab = (tabs && tabs.length > 0) ? (tabs.find(t => t.active) || tabs[tabs.length - 1]) : null;
 const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
 
 const title = await page.title();
@@ -203,7 +205,7 @@ console.log(JSON.stringify({{ ok: true, title, url: currentUrl, items }}));
 """
     res = await run_ego_js(code, timeout=9.0)
     if not res.get("ok"):
-        return f"获取页面候选操作失败: {res.get('error', '未知错误')}"
+        return f"【失败】 获取页面候选操作失败: {res.get('error', '未知错误')}"
 
     items: List[Dict[str, Any]] = res.get("items", [])
     if not items:
@@ -226,7 +228,7 @@ async def browser_click(text_or_selector: str) -> str:
     safe_target = json.dumps(target)
     code = f"""const task = await taskSpace("voice assistant web");
 const tabs = await task.tabs();
-const activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
+const activeTab = (tabs && tabs.length > 0) ? (tabs.find(t => t.active) || tabs[tabs.length - 1]) : null;
 const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
 
 const raw = {safe_target};
@@ -238,25 +240,25 @@ try {{
     const idMatch = raw.match(/^\\[?#?@?(\\d+)\\]?$/);
     if (idMatch) {{
         const targetId = idMatch[1];
-        clicked = await page.evaluate((tid) => {{
-            let el = document.querySelector(`[data-ego-action-id="${{tid}}"]`);
-            if (!el) {{
-                const selector = "a, button, input[type='button'], input[type='submit'], [role='button'], [role='link']";
-                const visible = Array.from(document.querySelectorAll(selector)).filter(e => {{
-                    const r = e.getBoundingClientRect();
-                    return r.width > 0 && r.height > 0 && window.getComputedStyle(e).display !== 'none';
-                }});
-                const num = parseInt(tid, 10) - 1;
-                if (num >= 0 && num < visible.length) el = visible[num];
-            }}
+        const findRes = await page.evaluate((tid) => {{
+            const el = document.querySelector(`[data-ego-action-id="${{tid}}"]`);
             if (el) {{
                 el.scrollIntoView({{ block: "center" }});
                 el.click();
-                return true;
+                return {{ found: true }};
             }}
-            return false;
+            return {{ found: false }};
         }}, targetId);
-        if (clicked) matchType = "候选编号ID[#" + targetId + "]";
+        if (findRes && findRes.found) {{
+            clicked = true;
+            matchType = "候选编号ID[#" + targetId + "]";
+        }} else {{
+            console.log(JSON.stringify({{
+                ok: false,
+                error: "候选操作编号 [#" + targetId + "] 在当前页面不存在或已失效。请调用 browser_list_actions 重新列举当前页面的可操作元素。"
+            }}));
+            return;
+        }}
     }}
 
     // 2. CSS/XPath 选择器
@@ -317,7 +319,7 @@ try {{
     res = await run_ego_js(code, timeout=10.0)
     if res.get("ok"):
         return f"已成功点击 '{target}'（匹配方式: {res.get('matchType', '文本')}），页面标题: {res.get('title', '')}，当前URL: {res.get('url', '')}"
-    return f"点击失败: {res.get('error')}"
+    return f"【失败】 点击失败: {res.get('error')}"
 
 
 async def browser_scroll(direction: str = "down") -> str:
@@ -327,8 +329,8 @@ async def browser_scroll(direction: str = "down") -> str:
     delta = 800 if direction.lower() == "down" else -800
     code = f"""const task = await taskSpace("voice assistant web");
 const tabs = await task.tabs();
-const targetTab = tabs[tabs.length - 1];
-const page = targetTab && targetTab.label ? task.page(targetTab.label) : task.page("p1");
+const activeTab = (tabs && tabs.length > 0) ? (tabs.find(t => t.active) || tabs[tabs.length - 1]) : null;
+const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
 
 await page.evaluate((d) => window.scrollBy(0, d), {delta});
 await page.waitForTimeout(600);
@@ -337,7 +339,7 @@ console.log(JSON.stringify({{ ok: true, message: "已滚动页面" }}));
     res = await run_ego_js(code, timeout=6.0)
     if res.get("ok"):
         return f"已向{'下' if delta > 0 else '上'}滚动页面"
-    return f"滚动失败: {res.get('error')}"
+    return f"【失败】 滚动失败: {res.get('error')}"
 
 
 def get_browser_function_declarations():
