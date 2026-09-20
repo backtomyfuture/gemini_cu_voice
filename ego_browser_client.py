@@ -1,19 +1,23 @@
 """
 ego lite (ego-browser) 浏览器自动化集成模块
-提供专为语音交互优化的极速页面导航、搜索与正文结构化提取能力
+提供专为语音交互优化的极速页面导航、搜索、候选交互清单与正文结构化提取能力
 """
 import asyncio
 import json
 import re
 import shutil
 import urllib.parse
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
 EGO_BROWSER_BIN = shutil.which("ego-browser") or "/Users/jarod/.local/bin/ego-browser"
 
 
 async def run_ego_js(js_code: str, timeout: float = 12.0) -> Dict[str, Any]:
     """通过 ego-browser nodejs 执行自动化脚本并解析 JSON 结果"""
+    clean_code = js_code.strip()
+    if not clean_code.startswith("(async () =>") and not clean_code.startswith("(async()=>"):
+        clean_code = f"(async () => {{\n{clean_code}\n}})();"
+
     try:
         proc = await asyncio.create_subprocess_exec(
             EGO_BROWSER_BIN, "nodejs",
@@ -22,7 +26,7 @@ async def run_ego_js(js_code: str, timeout: float = 12.0) -> Dict[str, Any]:
             stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=js_code.encode("utf-8")),
+            proc.communicate(input=clean_code.encode("utf-8")),
             timeout=timeout
         )
         combined = stdout.decode("utf-8", errors="replace") + stderr.decode("utf-8", errors="replace")
@@ -148,9 +152,75 @@ console.log(JSON.stringify({{ ok: true, title, url: currentUrl, text: text.slice
     return f"获取页面内容失败: {res.get('error', '无法获取')}"
 
 
+async def browser_list_actions(max_items: int = 25) -> str:
+    """
+    获取当前网页中所有可交互操作元素（链接、按钮、输入项）列表及稳定编号 [#ID]
+    用于杜绝重复文案导致的模糊误点击，提供高可靠候选确认能力
+    """
+    code = f"""const task = await taskSpace("voice assistant web");
+const tabs = await task.tabs();
+const activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
+const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
+
+const title = await page.title();
+const currentUrl = await page.url();
+
+const items = await page.evaluate((maxCount) => {{
+    const selector = "a, button, input[type='button'], input[type='submit'], [role='button'], [role='link']";
+    const candidates = Array.from(document.querySelectorAll(selector));
+    const results = [];
+    let idx = 1;
+
+    for (const el of candidates) {{
+        if (results.length >= maxCount) break;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") continue;
+
+        let txt = (el.innerText || el.textContent || el.value || el.getAttribute("aria-label") || el.getAttribute("title") || "").trim();
+        txt = txt.replace(/\\s+/g, " ");
+        if (!txt || txt.length < 2) continue;
+        if (txt.length > 70) txt = txt.slice(0, 70) + "...";
+
+        let role = el.tagName.toLowerCase();
+        if (el.getAttribute("role")) role = el.getAttribute("role");
+        const href = el.getAttribute("href") || "";
+
+        el.setAttribute("data-ego-action-id", String(idx));
+        results.push({{
+            id: idx,
+            role: role,
+            text: txt,
+            href: href.slice(0, 80)
+        }});
+        idx++;
+    }}
+    return results;
+}}, {max_items});
+
+console.log(JSON.stringify({{ ok: true, title, url: currentUrl, items }}));
+"""
+    res = await run_ego_js(code, timeout=9.0)
+    if not res.get("ok"):
+        return f"获取页面候选操作失败: {res.get('error', '未知错误')}"
+
+    items: List[Dict[str, Any]] = res.get("items", [])
+    if not items:
+        return f"【当前页面】: {res.get('title', '')}\n【提示】: 当前页面未找到明显的可交互链接或按钮。"
+
+    lines = [f"【页面可交互候选操作列表（共 {len(items)} 项，可直接调用 browser_click(text=\"#ID\") 点击）】:"]
+    for it in items:
+        role_desc = "链接" if it.get("role") in ["a", "link"] else "按钮"
+        href_desc = f" -> {it['href']}" if it.get("href") and not it['href'].startswith("javascript") else ""
+        lines.append(f"  [#{it['id']}] [{role_desc}] \"{it['text']}\"{href_desc}")
+
+    return "\n".join(lines)
+
+
 async def browser_click(text_or_selector: str) -> str:
     """
-    在当前页面点击指定文字或选择器（支持DOM原生遍历匹配与新标签页自动跟踪）
+    在当前页面点击指定文字、选择器或候选编号[#ID]（支持准确 ID 匹配与新标签页自动跟踪）
     """
     target = text_or_selector.strip()
     safe_target = json.dumps(target)
@@ -162,30 +232,60 @@ const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.pa
 const raw = {safe_target};
 try {{
     let clicked = false;
-    // 1. 如果是 css/xpath 选择器
-    if (raw.startsWith("#") || raw.startsWith(".") || raw.startsWith("//") || raw.startsWith("a[")) {{
+    let matchType = "";
+
+    // 1. 编号候选快速点击 (如 "#1", "1", "[#1]", "@1")
+    const idMatch = raw.match(/^\\[?#?@?(\\d+)\\]?$/);
+    if (idMatch) {{
+        const targetId = idMatch[1];
+        clicked = await page.evaluate((tid) => {{
+            let el = document.querySelector(`[data-ego-action-id="${{tid}}"]`);
+            if (!el) {{
+                const selector = "a, button, input[type='button'], input[type='submit'], [role='button'], [role='link']";
+                const visible = Array.from(document.querySelectorAll(selector)).filter(e => {{
+                    const r = e.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0 && window.getComputedStyle(e).display !== 'none';
+                }});
+                const num = parseInt(tid, 10) - 1;
+                if (num >= 0 && num < visible.length) el = visible[num];
+            }}
+            if (el) {{
+                el.scrollIntoView({{ block: "center" }});
+                el.click();
+                return true;
+            }}
+            return false;
+        }}, targetId);
+        if (clicked) matchType = "候选编号ID[#" + targetId + "]";
+    }}
+
+    // 2. CSS/XPath 选择器
+    if (!clicked && (raw.startsWith("#") || raw.startsWith(".") || raw.startsWith("//") || raw.startsWith("a["))) {{
         await page.click(raw, {{ timeout: 3000 }});
         clicked = true;
-    }} else {{
-        // 2. 原生 DOM 查找与点击，严格匹配，防止误点其他无关链接
+        matchType = "选择器";
+    }}
+
+    // 3. 原生 DOM 文本匹配
+    if (!clicked) {{
         clicked = await page.evaluate((txt) => {{
             const elements = Array.from(document.querySelectorAll("a, button, [role='button'], h1, h2, h3, h4, span, div, p"));
             const cleanTxt = txt.trim().toLowerCase();
-            
-            // 2.1 精确匹配
+
+            // 3.1 精确匹配
             let match = elements.find(el => el.innerText && el.innerText.trim().toLowerCase() === cleanTxt);
-            
-            // 2.2 包含完整目标词 (要求目标词不少于2个字符)
+
+            // 3.2 包含完整目标词 (不少于2字符)
             if (!match && cleanTxt.length >= 2) {{
                 match = elements.find(el => el.innerText && el.innerText.trim().toLowerCase().includes(cleanTxt));
             }}
-            
-            // 2.3 较长目标词（>10字）前缀匹配（必须至少前8个字严格连续包含）
-            if (!match && cleanTxt.length >= 10) {{
+
+            // 3.3 前缀连续匹配
+            if (!match && cleanTxt.length >= 8) {{
                 const prefix = cleanTxt.slice(0, 8);
                 match = elements.find(el => el.innerText && el.innerText.toLowerCase().includes(prefix));
             }}
-            
+
             if (match) {{
                 const anchor = match.closest("a") || match.closest("button") || match;
                 anchor.scrollIntoView({{ block: "center" }});
@@ -194,28 +294,29 @@ try {{
             }}
             return false;
         }}, raw);
+        if (clicked) matchType = "文本匹配";
+    }}
 
-        if (!clicked) {{
-            console.log(JSON.stringify({{ ok: false, error: "未在页面中找到包含 '" + raw + "' 的可点击链接或内容。请先调用 browser_get_content 查看页面当前实际显示的文本。" }}));
-            return;
-        }}
+    if (!clicked) {{
+        console.log(JSON.stringify({{ ok: false, error: "未找到包含 '" + raw + "' 的可点击目标。建议先调用 browser_list_actions 获取精准选项编号。" }}));
+        return;
     }}
 
     await page.waitForTimeout(1000);
-    // 检查是否产生了新 Tab（如 target="_blank"）
+    // 检查是否产生了新 Tab
     const newTabs = await task.tabs();
     const targetTab = newTabs[newTabs.length - 1];
     const targetPage = targetTab && targetTab.label ? task.page(targetTab.label) : page;
     const title = await targetPage.title();
     const url = await targetPage.url();
-    console.log(JSON.stringify({{ ok: true, message: "点击成功", title, url }}));
+    console.log(JSON.stringify({{ ok: true, matchType, title, url }}));
 }} catch (e) {{
     console.log(JSON.stringify({{ ok: false, error: String(e) }}));
 }}
 """
     res = await run_ego_js(code, timeout=10.0)
     if res.get("ok"):
-        return f"已成功点击 '{target}'，当前页面标题: {res.get('title', '')}"
+        return f"已成功点击 '{target}'（匹配方式: {res.get('matchType', '文本')}），页面标题: {res.get('title', '')}，当前URL: {res.get('url', '')}"
     return f"点击失败: {res.get('error')}"
 
 
@@ -285,14 +386,27 @@ def get_browser_function_declarations():
             }
         ),
         types.FunctionDeclaration(
+            name="browser_list_actions",
+            description="获取当前网页中所有可交互操作元素（链接、按钮）列表及对应编号 [#ID]。当页面有多个相似项或需精确点击时，先调用此工具列出候选编号，再用 browser_click 点击。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "max_items": {
+                        "type": "integer",
+                        "description": "最多提取的操作项数量，默认 25"
+                    }
+                }
+            }
+        ),
+        types.FunctionDeclaration(
             name="browser_click",
-            description="在 Ego Lite 浏览器当前页面中点击指定文本内容的链接或按钮。",
+            description="在 Ego Lite 浏览器当前页面中点击指定链接或按钮。支持传入候选编号（如 '#1' 或 '1'）或直接传入文字标题。",
             parameters={
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "要点击的链接文字或按钮文字，例如 '下一页', '登录', '新闻'"
+                        "description": "要点击的候选编号（如 '#1'）或链接文字、按钮文字"
                     }
                 },
                 "required": ["text"]
@@ -312,4 +426,3 @@ def get_browser_function_declarations():
             }
         )
     ]
-
