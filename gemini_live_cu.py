@@ -191,47 +191,56 @@ if not os.environ.get("http_proxy") and not os.environ.get("https_proxy"):
         except Exception:
             pass
 
+from ego_browser_client import (
+    browser_open,
+    browser_search,
+    browser_get_content,
+    browser_click,
+    browser_scroll,
+    get_browser_function_declarations
+)
+
 MODEL_FAST = "gemini-3.8-live"
 MODEL_THINKING = "gemini-3.8-live-extended-thinking"
 
 SYSTEM_INSTRUCTION = """
 你是一个运行在 macOS 上的实时语音电脑操作管家。
-你能操控 macOS 桌面上的所有应用和窗口。
+你能操控 macOS 桌面上的所有应用和窗口，并具备强劲的网页浏览与检索能力。
 
 【工具能力与使用规则】：
-- open_app: 打开或前台激活任意应用程序（计算器、备忘录、Safari、微信、音乐等）。用户要求“打开XXX”时必须优先调用此工具！
-- list_apps: 查看当前正在运行的所有应用程序（包含 name, bundle_id, pid）。操作前可用此工具确认目标应用是否在运行。
-- get_app_state: 获取指定应用的窗口控件树（参数 app 传 bundle_id，mode 建议使用 'ax' 获取极速控件树，每个控件都有唯一的 index）。
-- click: 点击目标应用的控件（传 app 和控件 index，或点击坐标 x, y）。
-- type_text: 向目标应用输入文本（支持 clear=True 清空后输入，submit=True 按回车提交）。
-- press_key: 向应用发送按键或快捷键（如 return, enter, escape, cmd+c, cmd+v, cmd+w, ctrl+cmd+f 等，参数 app 传 bundle_id）。
-- scroll: 滚动应用窗口。
-- set_value: 直接设置输入框内容。
-- select_text: 选取文本内容。
+1. 应用程序管理（macOS 本地）：
+   - open_app: 打开或前台激活任意应用程序（计算器、备忘录、微信、音乐、Pages 等）。用户要求“打开XXX”时必须优先调用此工具！
+   - list_apps: 查看当前正在运行的所有应用程序（包含 name, bundle_id, pid）。操作前可用此工具确认目标应用是否在运行。
+   - get_app_state: 获取指定桌面应用的窗口控件树（参数 app 传 bundle_id，mode 建议使用 'ax' 获取极速控件树）。
+   - click: 点击目标桌面应用的控件（传 app 和控件 index，或点击坐标 x, y）。
+   - type_text: 向目标应用输入文本（支持 clear=True 清空后输入，submit=True 按回车提交）。
+   - press_key: 向应用发送按键或快捷键（如 return, enter, escape, cmd+c, cmd+v, cmd+w 等，参数 app 传 bundle_id）。
+   - scroll: 滚动桌面应用窗口。
+
+2. 网页浏览与联网搜索（基于 Ego Lite 极速浏览器）：
+   - browser_open: 打开指定网址或 URL，返回网页标题与精简正文（如 browser_open(url="https://news.ycombinator.com")）。
+   - browser_search: 在浏览器中搜索关键词并提炼要点（如 browser_search(query="特斯拉 Roadster 最新售价")）。
+   - browser_get_content: 抓取当前已打开网页的正文内容并总结。
+   - browser_click: 在当前网页中点击指定链接或按钮（如 browser_click(text="新闻")）。
+   - browser_scroll: 在当前网页中向上或向下滚动（如 browser_scroll(direction="down")）。
+   【重要原则】：所有网页访问、互联网资讯搜索、网页内容阅读一律优先使用 browser_* 系列工具！严禁用 kimi-cu 去操作 Safari 或 Chrome。
 
 【应用启动与操作规范】：
-1. 打开任何应用程序（计算器、备忘录、音乐、微信、日历、Safari、Chrome 等）：
+1. 打开任何应用程序（计算器、备忘录、音乐、微信、日历等）：
    - 当用户要求打开软件时，直接调用 open_app(name="应用名")！
-     例如：
-     - 打开计算器 -> open_app(name="计算器")
-     - 打开备忘录 -> open_app(name="备忘录")
-     - 打开微信 -> open_app(name="微信")
-     - 打开Safari -> open_app(name="Safari")
-   - open_app 执行成功后应用即已在前台。严禁反复用 cmd+space 重试打开！直接向用户简练汇报“已为您打开计算器”。
+   - open_app 执行成功后应用即已在前台。严禁反复用 cmd+space 重试打开！直接向用户简练汇报“已为您打开XXX”。
 2. 计算器操作规范：
    - 打开计算器后，bundle_id 为 "com.apple.calculator"；
    - 可以在计算器中输入算式或按键：例如调用 type_text(app="com.apple.calculator", text="128*4=", submit=True)，或通过 press_key 输入按键；
    - 然后通过 get_app_state 获取显示结果并告知用户。
-3. 浏览器（Safari / Chrome）操作规范：
-   - Safari 的 bundle_id 为 "com.apple.Safari"；Chrome 为 "com.google.Chrome"；
-   - 置顶全屏：press_key(app="com.apple.Safari", keys="ctrl+cmd+f", activate=True)；
-   - 访问网址：press_key(app="com.apple.Safari", keys="cmd+l", activate=True)，随后 type_text(app="com.apple.Safari", text="网址", clear=True, submit=True)；
-   - 提取网页内容：get_app_state(app="com.apple.Safari", mode="ax")，拿到返回正文后为用户简明口语总结。
+3. 网页与搜索操作规范：
+   - 搜资料/查新闻/看网页：直接调用 browser_search(query="关键词") 或 browser_open(url="网址")；
+   - 工具返回正文后，结合正文用流畅、生动的口语为用户概括回答核心内容。
 
 【交互与口语原则】：
 1. 【静默动作，一次性总结汇报】：
    - 执行操作时直接下发工具，不要在调用前说废话；
-   - 动作执行成功后，用简明自然的中文口语告知用户最终结果（如“计算器已为您打开”）；
+   - 动作执行成功后，用简明自然的中文口语告知用户最终结果；
    - 严禁对同一动作连续死循环重复调用！若工具已成功返回，立即结束动作并作口语回复。
 2. 【日常问答自然连贯】：
    - 用户日常打招呼或闲聊时，口语自然流畅地回答。
@@ -678,6 +687,36 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
                                     res_text = raw_text
                                     log_event("MCP_RESULT", f"open_app ({cost_ms}ms) result: {res_text}")
                                     print(f"✨ [启动应用完成] open_app ({cost_ms}ms, {res_text})")
+                                elif func_name == "browser_open":
+                                    url = func_args.get("url", "") or func_args.get("url_or_kw", "")
+                                    res_text = await browser_open(url)
+                                    cost_ms = int((time.time() - t_start) * 1000)
+                                    log_event("BROWSER_RESULT", f"browser_open ({cost_ms}ms) len={len(res_text)}")
+                                    print(f"✨ [Ego 浏览器] browser_open ({cost_ms}ms, {res_text[:60].strip()}...)")
+                                elif func_name == "browser_search":
+                                    query = func_args.get("query", "")
+                                    engine = func_args.get("engine", "baidu")
+                                    res_text = await browser_search(query, engine)
+                                    cost_ms = int((time.time() - t_start) * 1000)
+                                    log_event("BROWSER_RESULT", f"browser_search ({cost_ms}ms) len={len(res_text)}")
+                                    print(f"✨ [Ego 浏览器] browser_search ({cost_ms}ms, {res_text[:60].strip()}...)")
+                                elif func_name == "browser_get_content":
+                                    res_text = await browser_get_content()
+                                    cost_ms = int((time.time() - t_start) * 1000)
+                                    log_event("BROWSER_RESULT", f"browser_get_content ({cost_ms}ms) len={len(res_text)}")
+                                    print(f"✨ [Ego 浏览器] browser_get_content ({cost_ms}ms)")
+                                elif func_name == "browser_click":
+                                    target = func_args.get("text", "") or func_args.get("text_or_selector", "") or func_args.get("target", "")
+                                    res_text = await browser_click(target)
+                                    cost_ms = int((time.time() - t_start) * 1000)
+                                    log_event("BROWSER_RESULT", f"browser_click ({cost_ms}ms): {res_text}")
+                                    print(f"✨ [Ego 浏览器] browser_click ({cost_ms}ms, {res_text})")
+                                elif func_name == "browser_scroll":
+                                    direction = func_args.get("direction", "down")
+                                    res_text = await browser_scroll(direction)
+                                    cost_ms = int((time.time() - t_start) * 1000)
+                                    log_event("BROWSER_RESULT", f"browser_scroll ({cost_ms}ms): {res_text}")
+                                    print(f"✨ [Ego 浏览器] browser_scroll ({cost_ms}ms, {res_text})")
                                 else:
                                     mcp_res = await mcp_session.call_tool(func_name, func_args)
                                     cost_ms = int((time.time() - t_start) * 1000)
@@ -696,7 +735,7 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
                             except Exception as err:
                                 res_text = f"Error: {err}"
                                 log_event("MCP_ERROR", f"{func_name} failed: {err}")
-                                print(f"❌ [kimi-cu 失败] {err}")
+                                print(f"❌ [{func_name} 失败] {err}")
 
                             function_responses.append(
                                 types.FunctionResponse(
@@ -872,6 +911,7 @@ async def main():
                     }
                 )
                 gemini_functions.append(open_app_tool)
+                gemini_functions.extend(get_browser_function_declarations())
 
                 tool_names = [t.name for t in gemini_functions]
                 print(f"✅ 成功加载 {len(gemini_functions)} 个 macOS 原生桌面控制工具:")
