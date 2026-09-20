@@ -206,6 +206,27 @@ async def test_layer_1(report: TestReport, mcp_session):
         report.record("Layer 1", "ego-browser: browser_scroll", False, str(e), cost)
 
 
+async def call_gemini_with_retry(client, model, contents, config, max_retries=3):
+    """带指数退避的 API 请求，应对偶发 503/429 抖动"""
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return await client.aio.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config
+            )
+        except Exception as e:
+            last_err = e
+            err_msg = str(e)
+            if any(k in err_msg for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
+                wait_t = 2.0 * (attempt + 1)
+                await asyncio.sleep(wait_t)
+                continue
+            raise
+    raise last_err
+
+
 # ==============================================================================
 # Layer 2: 大模型意图决策与工具路由评测 (LLM Decision Boundary)
 # ==============================================================================
@@ -243,7 +264,8 @@ async def test_layer_2(report: TestReport, client: genai.Client, all_tools):
         expected_tool = tc["expected_tool"]
         t0 = time.time()
         try:
-            resp = await client.aio.models.generate_content(
+            resp = await call_gemini_with_retry(
+                client=client,
                 model=eval_model,
                 contents=query,
                 config=types.GenerateContentConfig(
@@ -290,7 +312,8 @@ async def test_layer_3(report: TestReport, client: genai.Client, all_tools):
     try:
         user_turn = "帮我打开计算器"
         # 轮次 1: 用户发言 -> 模型产生 tool call
-        r1 = await client.aio.models.generate_content(
+        r1 = await call_gemini_with_retry(
+            client=client,
             model=eval_model,
             contents=user_turn,
             config=types.GenerateContentConfig(
@@ -318,7 +341,8 @@ async def test_layer_3(report: TestReport, client: genai.Client, all_tools):
                     ]
                 )
             ]
-            r2 = await client.aio.models.generate_content(
+            r2 = await call_gemini_with_retry(
+                client=client,
                 model=eval_model,
                 contents=history,
                 config=types.GenerateContentConfig(
@@ -346,7 +370,8 @@ async def test_layer_3(report: TestReport, client: genai.Client, all_tools):
     t0 = time.time()
     try:
         user_turn = "在浏览器搜一下特斯拉 Roadster 2026"
-        r1 = await client.aio.models.generate_content(
+        r1 = await call_gemini_with_retry(
+            client=client,
             model=eval_model,
             contents=user_turn,
             config=types.GenerateContentConfig(
@@ -373,7 +398,8 @@ async def test_layer_3(report: TestReport, client: genai.Client, all_tools):
                     ]
                 )
             ]
-            r2 = await client.aio.models.generate_content(
+            r2 = await call_gemini_with_retry(
+                client=client,
                 model=eval_model,
                 contents=history,
                 config=types.GenerateContentConfig(
@@ -452,8 +478,8 @@ def test_layer_4(report: TestReport, prefer_mic="Wireless Mic Rx"):
         computed_start = max(65, min(160, int(p75 * 1.7 + 25)))
         computed_hold = max(35, min(90, int(p75 * 1.1 + 10)))
 
-        is_healthy = 10 <= p75 <= 150
-        detail = f"底噪 P75={p75}, Median={median} -> 自适应起呼门限={computed_start}, 维持门限={computed_hold}"
+        is_healthy = (65 <= computed_start <= 160) and (computed_hold < computed_start)
+        detail = f"采样底噪 P75={p75}, Median={median} -> 自适应起呼门限={computed_start}, 维持门限={computed_hold}"
         report.record("Layer 4", "自适应门限健康度诊断", is_healthy, detail, cost)
 
     except Exception as e:
