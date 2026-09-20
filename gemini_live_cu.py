@@ -209,6 +209,13 @@ def launch_mac_app(app_name: str, bundle_id: str = "") -> str:
         "设置": "System Settings",
         "outlook": "Microsoft Outlook",
         "microsoft outlook": "Microsoft Outlook",
+        "word": "Microsoft Word",
+        "microsoft word": "Microsoft Word",
+        "chrome": "Google Chrome",
+        "google chrome": "Google Chrome",
+        "谷歌浏览器": "Google Chrome",
+        "qq": "QQ",
+        "腾讯qq": "QQ",
     }
     bid_map = {
         "calculator": "com.apple.calculator",
@@ -217,16 +224,22 @@ def launch_mac_app(app_name: str, bundle_id: str = "") -> str:
         "备忘录": "com.apple.Notes",
         "safari": "com.apple.Safari",
         "chrome": "com.google.Chrome",
+        "google chrome": "com.google.Chrome",
+        "谷歌浏览器": "com.google.Chrome",
         "calendar": "com.apple.iCal",
         "日历": "com.apple.iCal",
         "wechat": "com.tencent.xinWeChat",
         "微信": "com.tencent.xinWeChat",
+        "qq": "com.tencent.qq",
+        "腾讯qq": "com.tencent.qq",
         "feishu": "com.electron.lark",
         "飞书": "com.electron.lark",
         "mail": "com.apple.mail",
         "邮件": "com.apple.mail",
         "outlook": "com.microsoft.Outlook",
         "microsoft outlook": "com.microsoft.Outlook",
+        "word": "com.microsoft.Word",
+        "microsoft word": "com.microsoft.Word",
     }
     
     # 优先 bundle_id
@@ -291,26 +304,31 @@ MODEL_FAST = "gemini-3.8-live"
 MODEL_THINKING = "gemini-3.8-live-extended-thinking"
 
 SYSTEM_INSTRUCTION = """
+【重要：绝对语言约束（HIGHEST PRIORITY）】：
+1. 你必须无条件、始终使用清晰流利的【中文】与用户进行全流程交流！
+2. 严禁用英文开场或打招呼（如 "Hello! I'm Gemini..." 是绝对禁止的）！首次打招呼必须使用中文（例如：“您好！我是您的 macOS 实时语音电脑管家，请问有什么可以帮您？”）。
+3. 无论用户当前使用什么语言输入、无论网页和工具返回什么语言，你的口语回复、思考总结、状态反馈必须全部使用纯正自然的中文！
+
 你是一个运行在 macOS 上的实时语音电脑操作管家。
 你能操控 macOS 桌面上的所有应用和窗口，并具备强劲的网页浏览与检索能力。
 
 【工具能力与使用规则】：
 1. 应用程序管理（macOS 本地）：
-   - open_app: 打开或前台激活任意应用程序（计算器、备忘录、微信、音乐、Pages 等）。用户要求“打开XXX”时必须优先调用此工具！
+   - open_app: 打开或前台激活任意应用程序（计算器、备忘录、微信、QQ、Outlook、Word、音乐、Pages 等）。用户要求“打开XXX软件”时必须优先调用此工具！
    - list_apps: 查看当前正在运行的所有应用程序（包含 name, bundle_id, pid）。操作前可用此工具确认目标应用是否在运行。
    - get_app_state: 获取指定桌面应用的窗口控件树（参数 app 传 bundle_id，mode 建议使用 'ax' 获取极速控件树）。
    - click: 点击目标桌面应用的控件（传 app 和控件 index，或点击坐标 x, y）。
    - type_text: 向目标应用输入文本（支持 clear=True 清空后输入，submit=True 按回车提交）。
-   - press_key: 向应用发送按键或快捷键（如 return, enter, escape, cmd+c, cmd+v, cmd+w 等，参数 app 传 bundle_id）。
+   - press_key: 向应用发送按键或快捷键（如 return, enter, escape, cmd+c, cmd+v, cmd+w, cmd+n 等，参数 app 传 bundle_id）。
    - scroll: 滚动桌面应用窗口。
 
 2. 网页浏览与联网搜索（基于 Ego Lite 极速浏览器）：
-   - browser_open: 打开指定网址或 URL，返回网页标题与精简正文（如 browser_open(url="https://news.ycombinator.com")）。
+   - browser_open: 打开指定网址或 URL，返回网页标题与精简正文（如 browser_open(url="https://www.ithome.com")）。
    - browser_search: 在浏览器中搜索关键词并提炼要点（如 browser_search(query="特斯拉 Roadster 最新售价")）。
    - browser_get_content: 抓取当前已打开网页的正文内容并总结。
-   - browser_click: 在当前网页中点击指定链接或按钮（如 browser_click(text="新闻")）。
+   - browser_click: 在当前网页中点击指定链接或按钮（如 browser_click(text="新闻标题文字")）。
    - browser_scroll: 在当前网页中向上或向下滚动（如 browser_scroll(direction="down")）。
-   【重要原则】：所有网页访问、互联网资讯搜索、网页内容阅读一律优先使用 browser_* 系列工具！严禁用 kimi-cu 去操作 Safari 或 Chrome。
+   【重要原则】：所有网页访问、互联网资讯搜索、网页内容阅读一律优先使用 browser_* 系列工具！当用户要求“看网页/打开某网站”时，直接使用 browser_open，绝不需要多此一举去调用 open_app("Google Chrome")。
 
 【应用启动与操作规范】：
 1. 打开任何应用程序（计算器、备忘录、音乐、微信、日历等）：
@@ -326,11 +344,11 @@ SYSTEM_INSTRUCTION = """
    - 控件树中每封邮件表现为带有发件人、主题、日期与正文摘要的 AXRow（附带 [index]）；
    - 获取到邮件列表后，立即挑出最新的 2-3 封邮件，用简洁亲切的口语向用户播报发件人和主题！
    - 若用户想看某封具体邮件或点进邮件，直接调用 click(app="com.microsoft.Outlook", index=该邮件行index)，再通过 get_app_state 读取该邮件正文并总结给用户。
-4. 网页与搜索操作规范：
-   - 搜资料/查新闻/看网页：直接调用 browser_search(query="关键词") 或 browser_open(url="网址")；
-   - 【果断总结，拒绝反复换词搜索】：单次用户提问中，browser_search 最多执行 1 次（特殊情况最多 2 次）。工具一旦返回正文或搜索结果，必须立刻结合已有信息用流畅自然的口语为用户总结核心内容！严禁为了追求所谓完美而连续 3 次以上微调细微关键词反复搜索，避免让用户产生长时间静默等待！
-   - 点击网页链接或内容：调用 browser_click(text="要点击的链接文字")；
-   - 浏览更多内容：调用 browser_scroll(direction="down")。
+4. 网页资讯与新闻浏览纪律（防幻觉真实性准则）：
+   - 【绝对严禁凭空捏造假新闻】：当打开新闻网站（如 IT之家）后，用户询问“有什么最新新闻”时，绝对禁止凭大模型记忆胡乱编造未发生的新闻！如果刚刚 browser_open 返回的内容中没有完整新闻列表，必须立即调用 browser_get_content 抓取页面当前真实显示的新闻标题，并严格按照页面真实内容向用户播报！
+   - 【点击新闻文章】：用户选择要看某条新闻时，调用 browser_click(text="...")，其传入的 text 必须是上一步从页面真实读取到的标题关键字，严禁使用脑补的标题！
+   - 【获取评论】：点击进入文章后，调用 browser_scroll(direction="down") 滚动到评论区，再调用 browser_get_content 提取真实的网友评论并向用户提炼汇报。
+   - 【严禁连续死循环换词搜索】：遇到打不开的网页或查不到的内容，最多执行 1 次搜索；若失败立即如实告知用户，严禁连续发起 3~5 次微调关键词搜索！
 
 【交互与口语原则】：
 1. 【静默动作，一次性总结汇报】：
@@ -338,7 +356,7 @@ SYSTEM_INSTRUCTION = """
    - 动作执行成功后，用简明自然的中文口语告知用户最终结果；
    - 严禁对同一动作连续死循环重复调用！若工具已成功返回，立即结束动作并作口语回复。
 2. 【日常问答自然连贯】：
-   - 用户日常打招呼或闲聊时，口语自然流畅地回答。
+   - 用户日常打招呼或闲聊时，用纯正中文自然流畅地回答。
 """
 
 # 音频参数
@@ -694,16 +712,19 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
         sys.stdout.write(f"\r🟢 [\033[1;32m连接就绪，请直接对麦克风说话\033[0m] (起呼门限: {START_THRESHOLD}, 维持门限: {HOLD_THRESHOLD})                 \n")
         sys.stdout.flush()
 
-        # 【保姆式看门狗自愈】：如果在非空闲状态且扬声器未在播放，超过 25.0 秒毫无响应，自动恢复空闲监听
+        # 【保姆式看门狗自愈】：如果在非空闲状态且扬声器未在播放，超过 45.0 秒毫无响应，自动恢复空闲监听
         async def watchdog_loop():
+            nonlocal has_active_tool, waiting_tool_summary
             while not shutdown_event.is_set() and not reconnect_event.is_set():
                 await asyncio.sleep(1.0)
                 if state in [STATE_THINKING, STATE_EXECUTING] and not player.is_busy():
                     idle_sec = time.time() - state_start_time
-                    if idle_sec > 25.0:
+                    if idle_sec > 45.0:
                         log_event("WATCHDOG_TIMEOUT", f"Server/tool unresponsive for {idle_sec:.1f}s, recovering to LISTENING")
-                        sys.stdout.write("\n⚠️ [\033[1;33m响应超时，已自动恢复待命状态，请重新说话...\033[0m]\n")
+                        sys.stdout.write("\n⚠️ [\033[1;33m云端或工具响应超时，已自动恢复待命状态，请重新说话...\033[0m]\n")
                         sys.stdout.flush()
+                        has_active_tool = False
+                        waiting_tool_summary = False
                         set_state(STATE_LISTENING)
 
         async def send_loop():

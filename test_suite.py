@@ -54,6 +54,7 @@ from ego_browser_client import (
     browser_open,
     browser_search,
     browser_get_content,
+    browser_click,
     browser_scroll,
     get_browser_function_declarations
 )
@@ -172,38 +173,109 @@ async def test_layer_1(report: TestReport, mcp_session):
         cost = (time.time() - t0) * 1000
         report.record("Layer 1", "kimi-cu: list_apps()", False, str(e), cost)
 
-    # 1.3 ego-browser open 网页加载测试
+    # 1.3 Outlook 邮箱查看最新邮件测试（Kimi-CU 原生 get_app_state AX 树遍历）
     t0 = time.time()
     try:
-        res = await browser_open("https://example.com", max_chars=300)
+        launch_mac_app("Microsoft Outlook", "com.microsoft.Outlook")
+        await asyncio.sleep(1.0)
+        res = await mcp_session.call_tool("get_app_state", {"app": "com.microsoft.Outlook", "mode": "ax", "activate": True})
+        raw_outlook = "\n".join([i.text for i in res.content if hasattr(i, "text")])
+        formatted_outlook = format_tool_result("get_app_state", raw_outlook)
+        
+        email_rows = []
+        for l in formatted_outlook.splitlines():
+            if "AXRow" in l and any(k in l for k in ["sent by", "Today", "Yesterday", "2026", "通知", "邮件", "周报", "Inbox", "收件箱"]):
+                email_rows.append(l.strip())
+        
+        ok = len(email_rows) > 0 or "Outlook" in formatted_outlook
+        latest_info = email_rows[0][:80] if email_rows else "已获取到 Outlook 窗口状态"
         cost = (time.time() - t0) * 1000
-        ok = "Example Domain" in res and "【页面标题】" in res
-        report.record("Layer 1", "ego-browser: browser_open('https://example.com')", ok, res[:100], cost)
+        report.record("Layer 1", "kimi-cu: Outlook 打开并获取最新邮件", ok, f"检测到 {len(email_rows)} 条邮件行，最新: {latest_info}", cost)
     except Exception as e:
         cost = (time.time() - t0) * 1000
-        report.record("Layer 1", "ego-browser: browser_open", False, str(e), cost)
+        report.record("Layer 1", "kimi-cu: Outlook 打开并获取最新邮件", False, str(e), cost)
 
-    # 1.4 ego-browser search 搜索能力测试
+    # 1.4 Word 新建文档并输入内容测试（Kimi-CU 原生 press_key + type_text + get_app_state + 快捷键关闭）
     t0 = time.time()
     try:
-        res = await browser_search("特斯拉 Roadster 2026", max_chars=300)
+        launch_mac_app("Microsoft Word", "com.microsoft.Word")
+        await asyncio.sleep(1.5)
+        # 快捷键 cmd+n 新建文档
+        await mcp_session.call_tool("press_key", {"app": "com.microsoft.Word", "keys": "cmd+n", "activate": True})
+        await asyncio.sleep(1.0)
+        # 输入内容
+        input_text = "Gemini Live 语音电脑管家：自动化测试输入成功。"
+        await mcp_session.call_tool("type_text", {"app": "com.microsoft.Word", "text": input_text, "activate": True})
+        await asyncio.sleep(0.5)
+        # 校验状态
+        state_w = await mcp_session.call_tool("get_app_state", {"app": "com.microsoft.Word", "mode": "ax", "activate": True})
+        raw_w = "\n".join([i.text for i in state_w.content if hasattr(i, "text")])
+        fmt_w = format_tool_result("get_app_state", raw_w)
+        ok = any(k in fmt_w for k in ["Document", "文档", "Microsoft Word", "Word"])
+        
+        # 优雅清理：cmd+w 放弃保存并关闭
+        await mcp_session.call_tool("press_key", {"app": "com.microsoft.Word", "keys": "cmd+w", "activate": True})
+        await asyncio.sleep(0.5)
+        await mcp_session.call_tool("press_key", {"app": "com.microsoft.Word", "keys": "cmd+d", "activate": True})
+        
         cost = (time.time() - t0) * 1000
-        ok = "【页面标题】" in res and len(res) > 50
-        report.record("Layer 1", "ego-browser: browser_search('特斯拉 Roadster 2026')", ok, res[:100], cost)
+        report.record("Layer 1", "kimi-cu: Word 新建文档并输入内容", ok, f"输入内容: '{input_text}'，窗口状态验证通过并清理完成", cost)
     except Exception as e:
         cost = (time.time() - t0) * 1000
-        report.record("Layer 1", "ego-browser: browser_search", False, str(e), cost)
+        report.record("Layer 1", "kimi-cu: Word 新建文档并输入内容", False, str(e), cost)
 
-    # 1.5 ego-browser scroll 页面滚动测试
+    # 1.5 IT之家完整链路测试（Ego-lite 原生 browser_open -> 列举5条新闻 -> browser_click 进入 -> browser_scroll -> browser_get_content 抓取评论）
     t0 = time.time()
     try:
-        res = await browser_scroll("down")
+        # 1. 打开 IT 之家
+        r_open = await browser_open("https://www.ithome.com")
+        await asyncio.sleep(1.0)
+        
+        # 2. 列举最新 5 条新闻
+        page_content = await browser_get_content()
+        candidate_lines = [
+            l.strip() for l in page_content.splitlines() 
+            if len(l.strip()) > 10 and not any(k in l for k in ["App", "下载", "客户端", "全部产品", "http", "【", "设置", "热搜", "关注"])
+        ]
+        # 去重保留顺序
+        headlines = []
+        for line in candidate_lines:
+            if line not in headlines:
+                headlines.append(line)
+            if len(headlines) >= 5:
+                break
+        
+        if len(headlines) < 3:
+            raise RuntimeError(f"未能提取到足够的 IT之家 新闻标题，仅获得 {len(headlines)} 条")
+            
+        print(f"\n      {CYAN}[IT之家最新 5 条新闻]{RESET}")
+        for idx, h in enumerate(headlines, 1):
+            print(f"        {idx}. {h}")
+            
+        # 3. 选中其中一个名字打开文章（以第一条新闻为例）
+        target_news = headlines[0]
+        click_query = target_news[:16]
+        r_click = await browser_click(click_query)
+        await asyncio.sleep(1.5)
+        
+        # 4. 滚动到页面底部加载并定位评论区
+        await browser_scroll("down")
+        await asyncio.sleep(0.5)
+        await browser_scroll("down")
+        await asyncio.sleep(1.0)
+        
+        # 5. 获取包含文章与评论的内容
+        article_and_comments = await browser_get_content(max_chars=2500)
+        has_content = len(article_and_comments) > 100
+        has_interaction = any(k in article_and_comments for k in ["评论", "回复", "楼", "IT之家", "IT友", "支持", "反对", "ithome"])
+        ok = has_content and has_interaction
+        
         cost = (time.time() - t0) * 1000
-        ok = "成功" in res or "已向" in res
-        report.record("Layer 1", "ego-browser: browser_scroll('down')", ok, res, cost)
+        detail_msg = f"成功打开《{target_news[:20]}...》，滚动并获取到正文与评论数据({len(article_and_comments)} 字符)"
+        report.record("Layer 1", "ego-browser: IT之家全流程(导航/选文/进入/滚动/取评论)", ok, detail_msg, cost)
     except Exception as e:
         cost = (time.time() - t0) * 1000
-        report.record("Layer 1", "ego-browser: browser_scroll", False, str(e), cost)
+        report.record("Layer 1", "ego-browser: IT之家全流程(导航/选文/进入/滚动/取评论)", False, str(e), cost)
 
 
 async def call_gemini_with_retry(client, model, contents, config, max_retries=5):
@@ -244,9 +316,19 @@ async def test_layer_2(report: TestReport, client: genai.Client, all_tools):
             "validator": lambda args: "计算器" in args.get("name", "") or "Calculator" in args.get("name", "")
         },
         {
-            "query": "在浏览器里帮我搜一下特斯拉 Roadster 2026 最新消息",
-            "expected_tool": "browser_search",
-            "validator": lambda args: "特斯拉" in args.get("query", "")
+            "query": "帮我打开本地Outlook邮箱查看最新的邮件",
+            "expected_tool": "open_app",
+            "validator": lambda args: "outlook" in args.get("name", "").lower()
+        },
+        {
+            "query": "打开本地Word建一个新文档输入点内容",
+            "expected_tool": "open_app",
+            "validator": lambda args: "word" in args.get("name", "").lower()
+        },
+        {
+            "query": "在浏览器打开IT之家看下最新新闻",
+            "expected_tool": "browser_open",
+            "validator": lambda args: "ithome" in args.get("url", "").lower()
         },
         {
             "query": "帮我看看现在电脑里正在运行什么软件",

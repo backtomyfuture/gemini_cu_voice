@@ -59,10 +59,21 @@ async def browser_open(url_or_kw: str, max_chars: int = 1200) -> str:
             query_enc = urllib.parse.quote(target)
             target = f"https://www.baidu.com/s?wd={query_enc}"
 
+    safe_target = json.dumps(target)
     code = f"""const task = await taskSpace("voice assistant web");
 const page = task.page("p1");
-await page.goto("{target}");
-await page.waitForLoadState("load");
+const targetUrl = {safe_target};
+try {{
+    await page.goto(targetUrl, {{ waitUntil: "domcontentloaded", timeout: 6500 }});
+}} catch (e) {{
+    const currentUrl = await page.url();
+    const title = await page.title();
+    if (!currentUrl || currentUrl === "about:blank" || currentUrl === targetUrl) {{
+        console.log(JSON.stringify({{ ok: false, error: "网址无法访问或网络不可达: " + (e.message || String(e)) }}));
+        return;
+    }}
+}}
+
 const title = await page.title();
 const currentUrl = await page.url();
 const text = await page.evaluate(() => {{
@@ -86,7 +97,7 @@ const text = await page.evaluate(() => {{
 const cleanText = text.replace(/\\s+/g, " ").slice(0, {max_chars});
 console.log(JSON.stringify({{ ok: true, title, url: currentUrl, text: cleanText }}));
 """
-    res = await run_ego_js(code, timeout=12.0)
+    res = await run_ego_js(code, timeout=9.0)
     if res.get("ok"):
         title = res.get("title", "网页")
         url = res.get("url", target)
@@ -111,19 +122,22 @@ async def browser_search(query: str, engine: str = "baidu", max_chars: int = 120
     return await browser_open(url, max_chars=max_chars)
 
 
-async def browser_get_content(max_chars: int = 1500) -> str:
+async def browser_get_content(max_chars: int = 1800) -> str:
     """
-    抓取当前 ego lite 前台页面的正文内容
+    抓取当前 ego lite 前台最新页面的正文内容
     """
     code = f"""const task = await taskSpace("voice assistant web");
-const page = task.page("p1");
+const tabs = await task.tabs();
+const targetTab = tabs[tabs.length - 1];
+const page = targetTab && targetTab.label ? task.page(targetTab.label) : task.page("p1");
+
 const title = await page.title();
 const currentUrl = await page.url();
 const text = await page.evaluate(() => {{
     return document.body.innerText.split('\\n')
         .map(s => s.trim())
         .filter(s => s.length > 2)
-        .slice(0, 40)
+        .slice(0, 60)
         .join('\\n');
 }});
 console.log(JSON.stringify({{ ok: true, title, url: currentUrl, text: text.slice(0, {max_chars}) }}));
@@ -136,50 +150,70 @@ console.log(JSON.stringify({{ ok: true, title, url: currentUrl, text: text.slice
 
 async def browser_click(text_or_selector: str) -> str:
     """
-    在当前页面点击指定文字或选择器（支持智能模糊匹配与自动容错）
+    在当前页面点击指定文字或选择器（支持DOM原生遍历匹配与新标签页自动跟踪）
     """
     target = text_or_selector.strip()
     safe_target = json.dumps(target)
     code = f"""const task = await taskSpace("voice assistant web");
-const page = task.page("p1");
+const tabs = await task.tabs();
+const activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
+const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
+
 const raw = {safe_target};
 try {{
     let clicked = false;
-    // 1. 如果是 css/xpath/loc 选择器
-    if (raw.startsWith("#") || raw.startsWith(".") || raw.startsWith("loc=") || raw.startsWith("//")) {{
+    // 1. 如果是 css/xpath 选择器
+    if (raw.startsWith("#") || raw.startsWith(".") || raw.startsWith("//") || raw.startsWith("a[")) {{
         await page.click(raw, {{ timeout: 3000 }});
         clicked = true;
     }} else {{
-        // 2. 尝试模糊包含文本匹配 (exact: false)
-        const loc = page.getByText(raw, {{ exact: false }}).first();
-        if (await loc.count() > 0) {{
-            await loc.click({{ timeout: 3000 }});
-            clicked = true;
-        }} else {{
-            // 3. 尝试取前 8 个主要字词作为关键词模糊尝试
-            const shortWord = raw.slice(0, 8).trim();
-            if (shortWord.length >= 2) {{
-                const loc2 = page.getByText(shortWord, {{ exact: false }}).first();
-                if (await loc2.count() > 0) {{
-                    await loc2.click({{ timeout: 3000 }});
-                    clicked = true;
-                }}
+        // 2. 原生 DOM 查找与点击，严格匹配，防止误点其他无关链接
+        clicked = await page.evaluate((txt) => {{
+            const elements = Array.from(document.querySelectorAll("a, button, [role='button'], h1, h2, h3, h4, span, div, p"));
+            const cleanTxt = txt.trim().toLowerCase();
+            
+            // 2.1 精确匹配
+            let match = elements.find(el => el.innerText && el.innerText.trim().toLowerCase() === cleanTxt);
+            
+            // 2.2 包含完整目标词 (要求目标词不少于2个字符)
+            if (!match && cleanTxt.length >= 2) {{
+                match = elements.find(el => el.innerText && el.innerText.trim().toLowerCase().includes(cleanTxt));
             }}
-            if (!clicked) {{
-                // 4. 终极回退
-                await page.click('text=' + JSON.stringify(raw), {{ timeout: 2500 }});
-                clicked = true;
+            
+            // 2.3 较长目标词（>10字）前缀匹配（必须至少前8个字严格连续包含）
+            if (!match && cleanTxt.length >= 10) {{
+                const prefix = cleanTxt.slice(0, 8);
+                match = elements.find(el => el.innerText && el.innerText.toLowerCase().includes(prefix));
             }}
+            
+            if (match) {{
+                const anchor = match.closest("a") || match.closest("button") || match;
+                anchor.scrollIntoView({{ block: "center" }});
+                anchor.click();
+                return true;
+            }}
+            return false;
+        }}, raw);
+
+        if (!clicked) {{
+            console.log(JSON.stringify({{ ok: false, error: "未在页面中找到包含 '" + raw + "' 的可点击链接或内容。请先调用 browser_get_content 查看页面当前实际显示的文本。" }}));
+            return;
         }}
     }}
-    await page.waitForTimeout(600);
-    const title = await page.title();
-    console.log(JSON.stringify({{ ok: true, message: "点击成功", title }}));
+
+    await page.waitForTimeout(1000);
+    // 检查是否产生了新 Tab（如 target="_blank"）
+    const newTabs = await task.tabs();
+    const targetTab = newTabs[newTabs.length - 1];
+    const targetPage = targetTab && targetTab.label ? task.page(targetTab.label) : page;
+    const title = await targetPage.title();
+    const url = await targetPage.url();
+    console.log(JSON.stringify({{ ok: true, message: "点击成功", title, url }}));
 }} catch (e) {{
     console.log(JSON.stringify({{ ok: false, error: String(e) }}));
 }}
 """
-    res = await run_ego_js(code, timeout=9.0)
+    res = await run_ego_js(code, timeout=10.0)
     if res.get("ok"):
         return f"已成功点击 '{target}'，当前页面标题: {res.get('title', '')}"
     return f"点击失败: {res.get('error')}"
@@ -187,16 +221,19 @@ try {{
 
 async def browser_scroll(direction: str = "down") -> str:
     """
-    在当前网页滚动窗口
+    在当前网页滚动窗口（自动作用于最新打开的页面或标签页）
     """
-    delta = 600 if direction.lower() == "down" else -600
+    delta = 800 if direction.lower() == "down" else -800
     code = f"""const task = await taskSpace("voice assistant web");
-const page = task.page("p1");
-await page.mouse.wheel(0, {delta});
-await page.waitForTimeout(300);
+const tabs = await task.tabs();
+const targetTab = tabs[tabs.length - 1];
+const page = targetTab && targetTab.label ? task.page(targetTab.label) : task.page("p1");
+
+await page.evaluate((d) => window.scrollBy(0, d), {delta});
+await page.waitForTimeout(600);
 console.log(JSON.stringify({{ ok: true, message: "已滚动页面" }}));
 """
-    res = await run_ego_js(code, timeout=5.0)
+    res = await run_ego_js(code, timeout=6.0)
     if res.get("ok"):
         return f"已向{'下' if delta > 0 else '上'}滚动页面"
     return f"滚动失败: {res.get('error')}"
