@@ -1,0 +1,48 @@
+# 环境变量与密钥配置
+.env
+.env.local
+*.env
+
+# 日志文件
+*.log
+gemini_live_cu.log
+
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+.venv/
+venv/
+ENV/
+env/
+
+# macOS 系统文件
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# 编辑器与 IDE
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
