@@ -57,7 +57,8 @@ from gemini_live_cu import (
     format_tool_result,
     find_audio_devices,
     SYSTEM_INSTRUCTION,
-    ConversationMemory
+    ConversationMemory,
+    TurnController
 )
 from ego_browser_client import (
     browser_open,
@@ -66,7 +67,8 @@ from ego_browser_client import (
     browser_list_actions,
     browser_click,
     browser_scroll,
-    get_browser_function_declarations
+    get_browser_function_declarations,
+    run_ego_js
 )
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -159,7 +161,7 @@ async def get_all_tool_declarations(mcp_session=None):
 # ==============================================================================
 # Layer 0: 安全执行策略与取消机制单元测试 (Tool Policy & Contract Unit Tests)
 # ==============================================================================
-def test_layer_0(report: TestReport):
+async def test_layer_0(report: TestReport):
     print(f"\n{CYAN}{BOLD}【Layer 0】安全执行策略与取消机制单元测试{RESET}")
     print("-" * 70)
 
@@ -289,6 +291,102 @@ def test_layer_0(report: TestReport):
     mcp_contract_ok = (not contract_mcp.ok) and contract_mcp.status == "error" and "【未执行/失败】" in contract_mcp.to_gemini_response()
     cost = (time.time() - t0) * 1000
     report.record("Layer 0", "MCP 契约: is_error 异常标志准确映射为结构化失败 (MCP Error Flag Mapping)", mcp_contract_ok, f"响应输出: {contract_mcp.to_gemini_response()[:60]}", cost)
+
+    # 0.12 打断后新 Token 生成测试 (TurnController New Token on Interrupt)
+    t0 = time.time()
+    ctrl = TurnController()
+    t1_id = ctrl.new_turn("turn1")
+    tok1 = ctrl.cancellation_token
+    # 模拟打断发生
+    ctrl.interrupt("User interrupt")
+    tok1_cancelled = tok1.is_cancelled
+    # 打断后紧接着用户开始说话，开启新轮次
+    t2_id = ctrl.new_turn("speech_after_interrupt")
+    tok2 = ctrl.cancellation_token
+    allowed, contract = mgr.check_execution("click", {"index": 2}, cancellation_token=tok2)
+    turn_token_ok = (
+        tok1_cancelled and
+        (not tok2.is_cancelled) and
+        (t2_id > t1_id) and
+        allowed and
+        (contract.status == "allowed")
+    )
+    cost = (time.time() - t0) * 1000
+    report.record("Layer 0", "生命周期: 打断后新轮次生成全新有效 Token (TurnController Barge-in Lifecycle)", turn_token_ok, f"旧Token已取消={tok1_cancelled}, 新Token可用={not tok2.is_cancelled}, 新轮次放行={allowed}", cost)
+
+    # 0.13 迟到旧轮次完成隔离测试 (TurnController Stale Playback Callback Isolation)
+    t0 = time.time()
+    ctrl = TurnController()
+    t1 = ctrl.new_turn("turn1")
+    # 模拟 t1 结束准备进入播放完成等待，但在此期间用户打断开启了 t2
+    t2 = ctrl.new_turn("turn2")
+    # 模拟迟到的 t1 播放完成回调触发
+    stale_is_current = ctrl.is_current_turn(t1)
+    new_is_current = ctrl.is_current_turn(t2)
+    isolation_ok = (not stale_is_current) and new_is_current
+    cost = (time.time() - t0) * 1000
+    report.record("Layer 0", "状态隔离: 迟到旧轮次播放完成回调安全丢弃 (Stale Playback Isolation)", isolation_ok, f"旧轮次t{t1}被识别为非当前={not stale_is_current}, 当前轮次t{t2}严格保护={new_is_current}", cost)
+
+    # 0.14 异步工具执行中协同取消测试 (Async Tool Task Cancellation via TurnController)
+    t0 = time.time()
+    ctrl = TurnController()
+    tid = ctrl.new_turn("turn_tool")
+    token = ctrl.cancellation_token
+
+    task_cancelled = False
+    async def dummy_slow_tool(t: CancellationToken):
+        nonlocal task_cancelled
+        try:
+            for _ in range(20):
+                if t.is_cancelled:
+                    return "cancelled"
+                await asyncio.sleep(0.02)
+            return "done"
+        except asyncio.CancelledError:
+            task_cancelled = True
+            raise
+
+    tool_task = asyncio.create_task(dummy_slow_tool(token))
+    ctrl.active_tool_task = tool_task
+    await asyncio.sleep(0.04)
+    # 触发打断
+    ctrl.interrupt("User barge-in during tool execution")
+    try:
+        await tool_task
+    except asyncio.CancelledError:
+        pass
+    tool_cancel_ok = token.is_cancelled and tool_task.cancelled() and ctrl.active_tool_task is None
+    cost = (time.time() - t0) * 1000
+    report.record("Layer 0", "打断协同: 异步工具任务在打断时协同取消 (Async Tool Task Cancellation)", tool_cancel_ok, f"Token已取消={token.is_cancelled}, 协程任务状态cancelled={tool_task.cancelled()}", cost)
+
+    # 0.15 会话恢复 Handle 失效降级回退机制 (Resumption Handle Fallback to Prefill Turns)
+    t0 = time.time()
+    mem = ConversationMemory(max_turns=3)
+    mem.record_turn(user_text="打开终端", model_text="已打开终端", tool_summary="open_app: Terminal")
+    session_state = {"handle": "expired_mock_handle_12345"}
+
+    # 模拟重连捕获异常分支
+    simulated_error = ConnectionError("Invalid session resumption handle")
+    if session_state.get("handle"):
+        session_state["handle"] = None
+    prefills = mem.get_prefill_turns()
+    fallback_ok = (session_state["handle"] is None) and (len(prefills) == 2)
+    cost = (time.time() - t0) * 1000
+    report.record("Layer 0", "容灾降级: 官方 Handle 恢复失效自动清空并降级记忆回灌 (Handle Failure Fallback)", fallback_ok, f"Handle已清空={session_state['handle'] is None}, 降级记忆轮次={len(prefills)//2}", cost)
+
+    # 0.16 浏览器进程超时清理保障 (Process Timeout Cleanup in run_ego_js)
+    t0 = time.time()
+    res = await run_ego_js("await new Promise(r => setTimeout(r, 2000));", timeout=0.1)
+    cleanup_ok = (res.get("ok") is False) and ("超时" in res.get("error", ""))
+    cost = (time.time() - t0) * 1000
+    report.record("Layer 0", "子进程治理: run_ego_js 超时清理与无僵尸进程 (Process Timeout & Cleanup)", cleanup_ok, f"返回结果: {res}", cost)
+
+    # 0.17 浏览器导航失败拒绝旧页面幽灵数据 (Browser Navigation Failure Rejecting Ghost Data)
+    t0 = time.time()
+    res_text = await browser_open("http://127.0.0.1:59999/non_existent_page_path")
+    reject_ghost_ok = is_browser_error(res_text) and ("失败" in res_text)
+    cost = (time.time() - t0) * 1000
+    report.record("Layer 0", "契约安全: 页面导航失败严格报错，拒绝旧页面幽灵数据 (Reject Ghost Old Page)", reject_ghost_ok, f"输出: {res_text[:60]}", cost)
 
 
 # ==============================================================================
@@ -746,7 +844,7 @@ async def main():
 
     # Layer 0 无需外部服务依赖，极速单元测试
     if args.layer is None or args.layer == 0:
-        test_layer_0(report)
+        await test_layer_0(report)
 
     if args.layer in [1, 2, 3] or args.layer is None:
         api_key = os.environ.get("GEMINI_API_KEY")

@@ -11,13 +11,34 @@ from typing import Dict, Any, List, Optional
 
 EGO_BROWSER_BIN = shutil.which("ego-browser") or "/Users/jarod/.local/bin/ego-browser"
 
+# 全局活跃标签页追踪，确保跨工具调用操作同一页面，防止多标签漂移
+_CURRENT_ACTIVE_TAB_LABEL: Optional[str] = None
+
+
+def get_active_tab_label() -> Optional[str]:
+    """获取当前已追踪的活跃标签页 Label"""
+    return _CURRENT_ACTIVE_TAB_LABEL
+
+
+def set_active_tab_label(label: Optional[str]):
+    """显式设置当前活跃标签页 Label"""
+    global _CURRENT_ACTIVE_TAB_LABEL
+    _CURRENT_ACTIVE_TAB_LABEL = label
+
+
+def reset_active_tab():
+    """重置活跃标签页追踪"""
+    global _CURRENT_ACTIVE_TAB_LABEL
+    _CURRENT_ACTIVE_TAB_LABEL = None
+
 
 async def run_ego_js(js_code: str, timeout: float = 12.0) -> Dict[str, Any]:
-    """通过 ego-browser nodejs 执行自动化脚本并解析 JSON 结果"""
+    """通过 ego-browser nodejs 执行自动化脚本并解析 JSON 结果（支持超时强杀子进程，无僵尸进程残留）"""
     clean_code = js_code.strip()
     if not clean_code.startswith("(async () =>") and not clean_code.startswith("(async()=>"):
         clean_code = f"(async () => {{\n{clean_code}\n}})();"
 
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             EGO_BROWSER_BIN, "nodejs",
@@ -45,8 +66,20 @@ async def run_ego_js(js_code: str, timeout: float = 12.0) -> Dict[str, Any]:
             return {"ok": False, "error": combined.strip() or f"进程退出码: {proc.returncode}"}
         return {"ok": False, "error": f"浏览器未输出合法的 JSON 响应: {combined.strip()[:500]}"}
     except asyncio.TimeoutError:
+        if proc:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
         return {"ok": False, "error": f"浏览器操作超时 ({timeout}s)"}
     except Exception as e:
+        if proc:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
         return {"ok": False, "error": str(e)}
 
 
@@ -64,20 +97,25 @@ async def browser_open(url_or_kw: str, max_chars: int = 1200) -> str:
             target = f"https://www.baidu.com/s?wd={query_enc}"
 
     safe_target = json.dumps(target)
-    code = f"""const task = await taskSpace("voice assistant web");
+    safe_pref = json.dumps(_CURRENT_ACTIVE_TAB_LABEL)
+    code = f"""const preferredLabel = {safe_pref};
+const task = await taskSpace("voice assistant web");
 const tabs = await task.tabs();
-const activeTab = (tabs && tabs.length > 0) ? (tabs.find(t => t.active) || tabs[tabs.length - 1]) : null;
+let activeTab = null;
+if (preferredLabel && tabs && tabs.length > 0) {{
+    activeTab = tabs.find(t => t.label === preferredLabel);
+}}
+if (!activeTab && tabs && tabs.length > 0) {{
+    activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
+}}
 const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
+const currentActiveLabel = (activeTab && activeTab.label) ? activeTab.label : "p1";
 const targetUrl = {safe_target};
 try {{
     await page.goto(targetUrl, {{ waitUntil: "domcontentloaded", timeout: 6500 }});
 }} catch (e) {{
-    const currentUrl = await page.url();
-    const title = await page.title();
-    if (!currentUrl || currentUrl === "about:blank" || currentUrl === targetUrl) {{
-        console.log(JSON.stringify({{ ok: false, error: "网址无法访问或网络不可达: " + (e.message || String(e)) }}));
-        return;
-    }}
+    console.log(JSON.stringify({{ ok: false, error: "页面导航失败或网络不可达: " + (e.message || String(e)) }}));
+    return;
 }}
 
 const title = await page.title();
@@ -101,10 +139,12 @@ const text = await page.evaluate(() => {{
     return walk(document.body);
 }});
 const cleanText = text.replace(/\\s+/g, " ").slice(0, {max_chars});
-console.log(JSON.stringify({{ ok: true, title, url: currentUrl, text: cleanText }}));
+console.log(JSON.stringify({{ ok: true, title, url: currentUrl, text: cleanText, activeTabLabel: currentActiveLabel }}));
 """
     res = await run_ego_js(code, timeout=9.0)
     if res.get("ok"):
+        if res.get("activeTabLabel"):
+            set_active_tab_label(res["activeTabLabel"])
         title = res.get("title", "网页")
         url = res.get("url", target)
         text = res.get("text", "")
@@ -132,10 +172,19 @@ async def browser_get_content(max_chars: int = 1800) -> str:
     """
     抓取当前 ego lite 前台最新激活页面的正文内容
     """
-    code = f"""const task = await taskSpace("voice assistant web");
+    safe_pref = json.dumps(_CURRENT_ACTIVE_TAB_LABEL)
+    code = f"""const preferredLabel = {safe_pref};
+const task = await taskSpace("voice assistant web");
 const tabs = await task.tabs();
-const activeTab = (tabs && tabs.length > 0) ? (tabs.find(t => t.active) || tabs[tabs.length - 1]) : null;
+let activeTab = null;
+if (preferredLabel && tabs && tabs.length > 0) {{
+    activeTab = tabs.find(t => t.label === preferredLabel);
+}}
+if (!activeTab && tabs && tabs.length > 0) {{
+    activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
+}}
 const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
+const currentActiveLabel = (activeTab && activeTab.label) ? activeTab.label : "p1";
 
 const title = await page.title();
 const currentUrl = await page.url();
@@ -146,10 +195,12 @@ const text = await page.evaluate(() => {{
         .slice(0, 60)
         .join('\\n');
 }});
-console.log(JSON.stringify({{ ok: true, title, url: currentUrl, text: text.slice(0, {max_chars}) }}));
+console.log(JSON.stringify({{ ok: true, title, url: currentUrl, text: text.slice(0, {max_chars}), activeTabLabel: currentActiveLabel }}));
 """
     res = await run_ego_js(code, timeout=8.0)
     if res.get("ok"):
+        if res.get("activeTabLabel"):
+            set_active_tab_label(res["activeTabLabel"])
         return f"【当前页面】: {res.get('title')}\n【URL】: {res.get('url')}\n\n【页面内容】:\n{res.get('text')}"
     return f"【失败】 获取页面内容失败: {res.get('error', '无法获取')}"
 
@@ -159,10 +210,19 @@ async def browser_list_actions(max_items: int = 25) -> str:
     获取当前网页中所有可交互操作元素（链接、按钮、输入项）列表及稳定编号 [#ID]
     用于杜绝重复文案导致的模糊误点击，提供高可靠候选确认能力
     """
-    code = f"""const task = await taskSpace("voice assistant web");
+    safe_pref = json.dumps(_CURRENT_ACTIVE_TAB_LABEL)
+    code = f"""const preferredLabel = {safe_pref};
+const task = await taskSpace("voice assistant web");
 const tabs = await task.tabs();
-const activeTab = (tabs && tabs.length > 0) ? (tabs.find(t => t.active) || tabs[tabs.length - 1]) : null;
+let activeTab = null;
+if (preferredLabel && tabs && tabs.length > 0) {{
+    activeTab = tabs.find(t => t.label === preferredLabel);
+}}
+if (!activeTab && tabs && tabs.length > 0) {{
+    activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
+}}
 const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
+const currentActiveLabel = (activeTab && activeTab.label) ? activeTab.label : "p1";
 
 const title = await page.title();
 const currentUrl = await page.url();
@@ -201,11 +261,13 @@ const items = await page.evaluate((maxCount) => {{
     return results;
 }}, {max_items});
 
-console.log(JSON.stringify({{ ok: true, title, url: currentUrl, items }}));
+console.log(JSON.stringify({{ ok: true, title, url: currentUrl, items, activeTabLabel: currentActiveLabel }}));
 """
     res = await run_ego_js(code, timeout=9.0)
     if not res.get("ok"):
         return f"【失败】 获取页面候选操作失败: {res.get('error', '未知错误')}"
+    if res.get("activeTabLabel"):
+        set_active_tab_label(res["activeTabLabel"])
 
     items: List[Dict[str, Any]] = res.get("items", [])
     if not items:
@@ -226,9 +288,17 @@ async def browser_click(text_or_selector: str) -> str:
     """
     target = text_or_selector.strip()
     safe_target = json.dumps(target)
-    code = f"""const task = await taskSpace("voice assistant web");
+    safe_pref = json.dumps(_CURRENT_ACTIVE_TAB_LABEL)
+    code = f"""const preferredLabel = {safe_pref};
+const task = await taskSpace("voice assistant web");
 const tabs = await task.tabs();
-const activeTab = (tabs && tabs.length > 0) ? (tabs.find(t => t.active) || tabs[tabs.length - 1]) : null;
+let activeTab = null;
+if (preferredLabel && tabs && tabs.length > 0) {{
+    activeTab = tabs.find(t => t.label === preferredLabel);
+}}
+if (!activeTab && tabs && tabs.length > 0) {{
+    activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
+}}
 const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
 
 const raw = {safe_target};
@@ -307,17 +377,20 @@ try {{
     await page.waitForTimeout(1000);
     // 检查是否产生了新 Tab
     const newTabs = await task.tabs();
-    const targetTab = newTabs[newTabs.length - 1];
+    const targetTab = (newTabs && newTabs.length > 0) ? newTabs[newTabs.length - 1] : activeTab;
     const targetPage = targetTab && targetTab.label ? task.page(targetTab.label) : page;
+    const finalLabel = targetTab && targetTab.label ? targetTab.label : (activeTab && activeTab.label ? activeTab.label : "p1");
     const title = await targetPage.title();
     const url = await targetPage.url();
-    console.log(JSON.stringify({{ ok: true, matchType, title, url }}));
+    console.log(JSON.stringify({{ ok: true, matchType, title, url, activeTabLabel: finalLabel }}));
 }} catch (e) {{
     console.log(JSON.stringify({{ ok: false, error: String(e) }}));
 }}
 """
     res = await run_ego_js(code, timeout=10.0)
     if res.get("ok"):
+        if res.get("activeTabLabel"):
+            set_active_tab_label(res["activeTabLabel"])
         return f"已成功点击 '{target}'（匹配方式: {res.get('matchType', '文本')}），页面标题: {res.get('title', '')}，当前URL: {res.get('url', '')}"
     return f"【失败】 点击失败: {res.get('error')}"
 
@@ -327,17 +400,28 @@ async def browser_scroll(direction: str = "down") -> str:
     在当前网页滚动窗口（自动作用于最新打开的页面或标签页）
     """
     delta = 800 if direction.lower() == "down" else -800
-    code = f"""const task = await taskSpace("voice assistant web");
+    safe_pref = json.dumps(_CURRENT_ACTIVE_TAB_LABEL)
+    code = f"""const preferredLabel = {safe_pref};
+const task = await taskSpace("voice assistant web");
 const tabs = await task.tabs();
-const activeTab = (tabs && tabs.length > 0) ? (tabs.find(t => t.active) || tabs[tabs.length - 1]) : null;
+let activeTab = null;
+if (preferredLabel && tabs && tabs.length > 0) {{
+    activeTab = tabs.find(t => t.label === preferredLabel);
+}}
+if (!activeTab && tabs && tabs.length > 0) {{
+    activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
+}}
 const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
+const currentActiveLabel = (activeTab && activeTab.label) ? activeTab.label : "p1";
 
 await page.evaluate((d) => window.scrollBy(0, d), {delta});
 await page.waitForTimeout(600);
-console.log(JSON.stringify({{ ok: true, message: "已滚动页面" }}));
+console.log(JSON.stringify({{ ok: true, message: "已滚动页面", activeTabLabel: currentActiveLabel }}));
 """
     res = await run_ego_js(code, timeout=6.0)
     if res.get("ok"):
+        if res.get("activeTabLabel"):
+            set_active_tab_label(res["activeTabLabel"])
         return f"已向{'下' if delta > 0 else '上'}滚动页面"
     return f"【失败】 滚动失败: {res.get('error')}"
 

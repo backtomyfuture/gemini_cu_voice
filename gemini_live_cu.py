@@ -82,6 +82,43 @@ class ConversationMemory:
         return list(self.history)
 
 
+class TurnController:
+    """集中式轮次生命周期控制器，管理单调递增 turn_id、当前取消令牌、后台工具任务与播放结束隔离"""
+    def __init__(self):
+        self.current_turn_id: int = 0
+        self.cancellation_token: CancellationToken = CancellationToken("turn_0")
+        self.active_tool_task: Optional[asyncio.Task] = None
+        self.waiting_tool_summary: bool = False
+        self.has_active_tool: bool = False
+        self.is_interrupted: bool = False
+
+    def new_turn(self, reason: str = "new_turn") -> int:
+        """开启新轮次：递增 turn_id，生成全新有效 CancellationToken，取消可能残余的工具任务"""
+        self.current_turn_id += 1
+        if self.active_tool_task and not self.active_tool_task.done():
+            self.active_tool_task.cancel()
+            self.active_tool_task = None
+        self.cancellation_token = CancellationToken(f"turn_{self.current_turn_id}_{time.time():.3f}")
+        self.has_active_tool = False
+        self.waiting_tool_summary = False
+        self.is_interrupted = False
+        return self.current_turn_id
+
+    def interrupt(self, reason: str = "interrupted"):
+        """处理打断：取消当前 Token 与工具任务，重置状态标记"""
+        self.is_interrupted = True
+        self.cancellation_token.cancel(reason)
+        if self.active_tool_task and not self.active_tool_task.done():
+            self.active_tool_task.cancel()
+            self.active_tool_task = None
+        self.has_active_tool = False
+        self.waiting_tool_summary = False
+
+    def is_current_turn(self, turn_id: int) -> bool:
+        """检查指定 turn_id 是否仍为当前最新轮次（用于丢弃迟到的旧轮次回调）"""
+        return self.current_turn_id == turn_id
+
+
 def update_env_file(path: Path, updates: dict):
     """安全更新 .env 文件中的指定键值对，保留现有注释与其它配置"""
     lines = []
@@ -625,13 +662,11 @@ async def run_session(
     silence_count = 0
     interrupt_frames = 0
     is_ready_to_listen = False
-    has_active_tool = False
-    waiting_tool_summary = False
-    is_interrupted = False
     calib_samples = []
     last_cli_print_time = 0.0
 
-    active_cancellation_token = CancellationToken("turn_init")
+    turn_ctrl = TurnController()
+    send_lock = asyncio.Lock()
 
     def set_state(new_state):
         nonlocal state, state_start_time, interrupt_frames
@@ -663,7 +698,7 @@ async def run_session(
 
     def mic_callback(indata, frames, time_info, status):
         nonlocal is_speaking, attack_count, silence_count, state, interrupt_frames
-        nonlocal START_THRESHOLD, HOLD_THRESHOLD, MIN_PEAK_RMS, INTERRUPT_RMS, is_interrupted, active_cancellation_token
+        nonlocal START_THRESHOLD, HOLD_THRESHOLD, MIN_PEAK_RMS, INTERRUPT_RMS
         nonlocal last_cli_print_time
 
         if mic_channels == 2:
@@ -700,14 +735,15 @@ async def run_session(
             if rms >= INTERRUPT_RMS:
                 interrupt_frames += 1
                 if interrupt_frames >= 2:
-                    is_interrupted = True
-                    active_cancellation_token.cancel("User interrupted during speaking")
+                    turn_ctrl.interrupt("User interrupted during speaking")
                     player.interrupt()
                     loop.call_soon_threadsafe(drain_audio_queue)
                     set_state(STATE_LISTENING)
                     is_speaking = True
                     attack_count = 0
                     silence_count = 0
+                    # 关键修复：打断后立刻为随后说的话开启全新轮次与有效 CancellationToken
+                    turn_ctrl.new_turn("speech_after_interrupt_speaking")
                     loop.call_soon_threadsafe(safe_put_audio, raw_bytes)
                     log_event("USER_INTERRUPT", f"User interrupted speaking (rms={rms})")
                     sys.stdout.write(f"\r🛑 [\033[1;31m已打断播报，请继续说...\033[0m]                           \n")
@@ -726,14 +762,14 @@ async def run_session(
             if rms >= INTERRUPT_RMS:
                 interrupt_frames += 1
                 if interrupt_frames >= 3:
-                    is_interrupted = True
-                    active_cancellation_token.cancel("User voice interrupt during tool execution")
+                    turn_ctrl.interrupt("User voice interrupt during tool execution")
                     player.interrupt()
                     loop.call_soon_threadsafe(drain_audio_queue)
                     set_state(STATE_LISTENING)
                     is_speaking = True
                     attack_count = 0
                     silence_count = 0
+                    turn_ctrl.new_turn("speech_after_interrupt_executing")
                     loop.call_soon_threadsafe(safe_put_audio, raw_bytes)
                     log_event("USER_INTERRUPT", f"User interrupted executing state (rms={rms})")
                     sys.stdout.write(f"\r🛑 [\033[1;31m已打断动作执行，请继续说...\033[0m]                           \n")
@@ -752,14 +788,14 @@ async def run_session(
             if rms >= max(260, int(START_THRESHOLD * 1.8)):
                 interrupt_frames += 1
                 if interrupt_frames >= 3:
-                    is_interrupted = True
-                    active_cancellation_token.cancel("User voice interrupt during thinking")
+                    turn_ctrl.interrupt("User voice interrupt during thinking")
                     player.interrupt()
                     loop.call_soon_threadsafe(drain_audio_queue)
                     set_state(STATE_LISTENING)
                     is_speaking = True
                     attack_count = 0
                     silence_count = 0
+                    turn_ctrl.new_turn("speech_after_interrupt_thinking")
                     loop.call_soon_threadsafe(safe_put_audio, raw_bytes)
                     log_event("USER_INTERRUPT", f"User interrupted thinking state (rms={rms})")
                     sys.stdout.write(f"\r🛑 [\033[1;31m已取消等待，请重新说...\033[0m]                           \n")
@@ -787,7 +823,7 @@ async def run_session(
                     is_speaking = True
                     silence_count = 0
                     attack_count = 0
-                    active_cancellation_token = CancellationToken(f"turn_{time.time()}")
+                    turn_ctrl.new_turn("speech_start")
                     for pr_chunk in pre_roll:
                         loop.call_soon_threadsafe(safe_put_audio, pr_chunk)
                     pre_roll.clear()
@@ -890,7 +926,7 @@ async def run_session(
                         reconnect_event.set()
                         break
 
-        # 音频流发送循环 (HybridVAD 模式)
+        # 音频流发送循环 (HybridVAD 模式，带 send_lock 保护)
         async def send_loop():
             try:
                 while not shutdown_event.is_set() and not reconnect_event.is_set():
@@ -898,27 +934,217 @@ async def run_session(
                     if item is None:
                         break
                     if item == AUDIO_STREAM_END:
-                        await session.send_realtime_input(audio_stream_end=True)
+                        async with send_lock:
+                            await session.send_realtime_input(audio_stream_end=True)
                         log_event("SEND_AUDIO_STREAM_END", "Sent audio_stream_end=True to Gemini")
                     else:
-                        await session.send_realtime_input(
-                            audio=types.Blob(
-                                data=item,
-                                mime_type="audio/pcm;rate=16000"
+                        async with send_lock:
+                            await session.send_realtime_input(
+                                audio=types.Blob(
+                                    data=item,
+                                    mime_type="audio/pcm;rate=16000"
+                                )
                             )
-                        )
             except asyncio.CancelledError:
                 pass
             except Exception as e:
                 log_event("SEND_ERROR", str(e))
                 reconnect_event.set()
 
+        # 异步工具执行任务：在独立后台任务中执行，完全不阻塞 recv_loop 接收打断信令
+        async def execute_tools_task(target_turn_id: int, tool_call: Any, token: CancellationToken):
+            if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
+                return
+            function_responses = []
+            try:
+                for call in tool_call.function_calls:
+                    if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
+                        break
+
+                    func_name = call.name
+                    func_args = call.args or {}
+
+                    allowed, policy_contract = policy_manager.check_execution(
+                        func_name, func_args, cancellation_token=token
+                    )
+
+                    if not allowed:
+                        log_event("POLICY_BLOCK", f"Tool {func_name} blocked: {policy_contract.summary}")
+                        print(f"\n🛡️  [安全策略拦截] \033[1;31m{func_name}\033[0m: {policy_contract.summary}")
+                        function_responses.append(
+                            types.FunctionResponse(
+                                name=func_name,
+                                id=call.id,
+                                response={"result": policy_contract.to_gemini_response()}
+                            )
+                        )
+                        continue
+
+                    log_event("TOOL_CALL", f"Calling {func_name} with args: {func_args}")
+                    print(f"\n🛠️  [执行动作] \033[1;33m{func_name}\033[0m({func_args})")
+
+                    if func_name in ["press_key", "type_text", "click"]:
+                        if not func_args.get("app") and not func_args.get("pid"):
+                            func_args["app"] = "com.apple.finder"
+
+                    if func_name in ["press_key", "type_text"]:
+                        func_args.setdefault("activate", True)
+                    elif func_name == "get_app_state":
+                        func_args.setdefault("mode", "ax")
+
+                    t_start = time.time()
+                    try:
+                        if func_name == "open_app":
+                            target_app = func_args.get("name", "") or func_args.get("app", "")
+                            target_bid = func_args.get("bundle_id", "")
+                            raw_text = launch_mac_app(target_app, target_bid)
+                            contract = ToolResultContract(
+                                ok="成功" in raw_text,
+                                action="open_app",
+                                status="success" if "成功" in raw_text else "error",
+                                summary=raw_text,
+                                side_effects="app_launched"
+                            )
+                        elif func_name == "browser_open":
+                            url = func_args.get("url", "") or func_args.get("url_or_kw", "")
+                            res_text = await browser_open(url)
+                            err = is_browser_error(res_text)
+                            contract = ToolResultContract(
+                                ok=not err,
+                                action="browser_open",
+                                status="success" if not err else "error",
+                                summary="已打开网页" if not err else res_text[:60],
+                                data=res_text,
+                                side_effects="navigation" if not err else "none",
+                                error=res_text if err else None
+                            )
+                        elif func_name == "browser_search":
+                            query = func_args.get("query", "")
+                            engine = func_args.get("engine", "baidu")
+                            res_text = await browser_search(query, engine)
+                            err = is_browser_error(res_text)
+                            contract = ToolResultContract(
+                                ok=not err,
+                                action="browser_search",
+                                status="success" if not err else "error",
+                                summary=f"已搜索关键词 '{query}'" if not err else res_text[:60],
+                                data=res_text,
+                                side_effects="navigation" if not err else "none",
+                                error=res_text if err else None
+                            )
+                        elif func_name == "browser_get_content":
+                            res_text = await browser_get_content()
+                            err = is_browser_error(res_text)
+                            contract = ToolResultContract(
+                                ok=not err,
+                                action="browser_get_content",
+                                status="success" if not err else "error",
+                                summary="已提取页面内容" if not err else res_text[:60],
+                                data=res_text,
+                                error=res_text if err else None
+                            )
+                        elif func_name == "browser_list_actions":
+                            max_items = func_args.get("max_items", 25)
+                            res_text = await browser_list_actions(max_items=max_items)
+                            err = is_browser_error(res_text)
+                            contract = ToolResultContract(
+                                ok=not err,
+                                action="browser_list_actions",
+                                status="success" if not err else "error",
+                                summary="已获取页面可操作候选项" if not err else res_text[:60],
+                                data=res_text,
+                                error=res_text if err else None
+                            )
+                        elif func_name == "browser_click":
+                            target = func_args.get("text", "") or func_args.get("text_or_selector", "") or func_args.get("target", "")
+                            res_text = await browser_click(target)
+                            err = is_browser_error(res_text) or ("已成功点击" not in res_text)
+                            contract = ToolResultContract(
+                                ok=not err,
+                                action="browser_click",
+                                status="success" if not err else "error",
+                                summary=res_text[:80],
+                                side_effects="ui_updated" if not err else "none",
+                                error=res_text if err else None
+                            )
+                        elif func_name == "browser_scroll":
+                            direction = func_args.get("direction", "down")
+                            res_text = await browser_scroll(direction)
+                            err = is_browser_error(res_text)
+                            contract = ToolResultContract(
+                                ok=not err,
+                                action="browser_scroll",
+                                status="success" if not err else "error",
+                                summary=res_text[:80],
+                                side_effects="ui_updated" if not err else "none",
+                                error=res_text if err else None
+                            )
+                        else:
+                            mcp_res = await mcp_session.call_tool(func_name, func_args)
+                            is_err = bool(getattr(mcp_res, "is_error", False) or getattr(mcp_res, "isError", False))
+                            texts = []
+                            for item in mcp_res.content:
+                                if hasattr(item, "text") and item.text:
+                                    texts.append(item.text)
+                                elif hasattr(item, "data"):
+                                    texts.append("[截图像素数据已捕获]")
+                            raw_text = "\n".join(texts) if texts else ("MCP 执行失败" if is_err else "ok")
+                            cleaned_text = format_tool_result(func_name, raw_text)
+                            contract = ToolResultContract(
+                                ok=not is_err,
+                                action=func_name,
+                                status="success" if not is_err else "error",
+                                summary=f"已执行 {func_name}" if not is_err else f"{func_name} 执行失败",
+                                data=cleaned_text,
+                                side_effects="ui_updated" if not is_err else "none",
+                                error=cleaned_text if is_err else None
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as err:
+                        contract = ToolResultContract(
+                            ok=False,
+                            action=func_name,
+                            status="error",
+                            summary="执行异常",
+                            error=str(err)
+                        )
+
+                    cost_ms = int((time.time() - t_start) * 1000)
+                    log_event("TOOL_RESULT", f"{func_name} ({cost_ms}ms) status={contract.status}")
+                    print(f"✨ [{func_name} 完成] ({cost_ms}ms, {contract.summary[:60]})")
+                    current_tools_executed.append(f"{func_name}: {contract.summary[:60]}")
+
+                    function_responses.append(
+                        types.FunctionResponse(
+                            name=func_name,
+                            id=call.id,
+                            response={"result": contract.to_gemini_response()}
+                        )
+                    )
+
+                if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
+                    log_event("TOOL_CANCELLED_DROP", f"Tools result dropped due to turn cancellation (turn {target_turn_id})")
+                    return
+
+                if function_responses:
+                    async with send_lock:
+                        await session.send_tool_response(function_responses=function_responses)
+                    log_event("TOOL_RESPONSE_SENT", f"Sent response for {len(function_responses)} calls, waiting for Gemini summary")
+                    turn_ctrl.has_active_tool = False
+                    turn_ctrl.waiting_tool_summary = True
+                    set_state(STATE_THINKING)
+            except asyncio.CancelledError:
+                log_event("TOOL_TASK_CANCELLED", f"Active tool task cancelled for turn {target_turn_id}")
+                turn_ctrl.has_active_tool = False
+            except Exception as e:
+                log_event("TOOL_TASK_ERROR", f"Error in execute_tools_task: {e}")
+                turn_ctrl.has_active_tool = False
+
         # 接收循环：常驻监听，使用公开 session.receive() 迭代器
         async def recv_loop():
-            nonlocal state, has_active_tool, waiting_tool_summary, is_interrupted, active_cancellation_token
-            current_user_transcript = []
-            current_model_transcript = []
-            current_tools_executed = []
+            nonlocal state
+            nonlocal current_user_transcript, current_model_transcript, current_tools_executed
 
             try:
                 while not shutdown_event.is_set() and not reconnect_event.is_set():
@@ -947,18 +1173,13 @@ async def run_session(
                         if getattr(response, "tool_call_cancellation", None) and response.tool_call_cancellation.ids:
                             cancelled_ids = set(response.tool_call_cancellation.ids)
                             log_event("SERVER_TOOL_CANCEL", f"Server cancelled tool call IDs: {cancelled_ids}")
-                            active_cancellation_token.cancel("Server cancelled tool call")
-                            has_active_tool = False
-                            waiting_tool_summary = False
+                            turn_ctrl.interrupt("Server cancelled tool call")
 
                         # 1. 检查服务端打断信号
                         if response.server_content and response.server_content.interrupted:
                             player.interrupt()
-                            active_cancellation_token.cancel("Server reported interrupted")
+                            turn_ctrl.interrupt("Server reported interrupted")
                             set_state(STATE_LISTENING)
-                            has_active_tool = False
-                            waiting_tool_summary = False
-                            is_interrupted = False
                             log_event("SERVER_INTERRUPT", "Server reported interrupted")
 
                         # 1.5 语音实时转录展示与收集
@@ -980,7 +1201,7 @@ async def run_session(
 
                         # 2. 模型回复内容（思考、文本与音频）
                         if response.server_content and response.server_content.model_turn:
-                            waiting_tool_summary = False
+                            turn_ctrl.waiting_tool_summary = False
                             for part in response.server_content.model_turn.parts:
                                 if part.text:
                                     if getattr(part, "thought", False):
@@ -992,188 +1213,25 @@ async def run_session(
                                         sys.stdout.write(part.text)
                                     sys.stdout.flush()
                                 if part.inline_data:
-                                    if is_interrupted or active_cancellation_token.is_cancelled:
+                                    if turn_ctrl.is_interrupted or turn_ctrl.cancellation_token.is_cancelled:
                                         continue
                                     set_state(STATE_SPEAKING)
                                     player.write(part.inline_data.data)
 
-                        # 3. 工具调用请求（接入 ToolPolicyManager、去重与结构化结果契约）
+                        # 3. 工具调用请求（异步解耦至独立后台任务，绝不阻塞 recv_loop）
                         if response.tool_call:
-                            has_active_tool = True
-                            waiting_tool_summary = False
+                            turn_ctrl.has_active_tool = True
+                            turn_ctrl.waiting_tool_summary = False
                             set_state(STATE_EXECUTING)
-                            function_responses = []
+                            turn_id = turn_ctrl.current_turn_id
+                            token = turn_ctrl.cancellation_token
+                            turn_ctrl.active_tool_task = asyncio.create_task(
+                                execute_tools_task(turn_id, response.tool_call, token)
+                            )
 
-                            for call in response.tool_call.function_calls:
-                                func_name = call.name
-                                func_args = call.args or {}
-
-                                allowed, policy_contract = policy_manager.check_execution(
-                                    func_name, func_args, cancellation_token=active_cancellation_token
-                                )
-
-                                if not allowed:
-                                    log_event("POLICY_BLOCK", f"Tool {func_name} blocked: {policy_contract.summary}")
-                                    print(f"\n🛡️  [安全策略拦截] \033[1;31m{func_name}\033[0m: {policy_contract.summary}")
-                                    function_responses.append(
-                                        types.FunctionResponse(
-                                            name=func_name,
-                                            id=call.id,
-                                            response={"result": policy_contract.to_gemini_response()}
-                                        )
-                                    )
-                                    continue
-
-                                log_event("TOOL_CALL", f"Calling {func_name} with args: {func_args}")
-                                print(f"\n🛠️  [执行动作] \033[1;33m{func_name}\033[0m({func_args})")
-
-                                if func_name in ["press_key", "type_text", "click"]:
-                                    if not func_args.get("app") and not func_args.get("pid"):
-                                        func_args["app"] = "com.apple.finder"
-
-                                if func_name in ["press_key", "type_text"]:
-                                    func_args.setdefault("activate", True)
-                                elif func_name == "get_app_state":
-                                    func_args.setdefault("mode", "ax")
-
-                                t_start = time.time()
-                                try:
-                                    if func_name == "open_app":
-                                        target_app = func_args.get("name", "") or func_args.get("app", "")
-                                        target_bid = func_args.get("bundle_id", "")
-                                        raw_text = launch_mac_app(target_app, target_bid)
-                                        contract = ToolResultContract(
-                                            ok="成功" in raw_text,
-                                            action="open_app",
-                                            status="success" if "成功" in raw_text else "error",
-                                            summary=raw_text,
-                                            side_effects="app_launched"
-                                        )
-                                    elif func_name == "browser_open":
-                                        url = func_args.get("url", "") or func_args.get("url_or_kw", "")
-                                        res_text = await browser_open(url)
-                                        err = is_browser_error(res_text)
-                                        contract = ToolResultContract(
-                                            ok=not err,
-                                            action="browser_open",
-                                            status="success" if not err else "error",
-                                            summary="已打开网页" if not err else res_text[:60],
-                                            data=res_text,
-                                            side_effects="navigation" if not err else "none",
-                                            error=res_text if err else None
-                                        )
-                                    elif func_name == "browser_search":
-                                        query = func_args.get("query", "")
-                                        engine = func_args.get("engine", "baidu")
-                                        res_text = await browser_search(query, engine)
-                                        err = is_browser_error(res_text)
-                                        contract = ToolResultContract(
-                                            ok=not err,
-                                            action="browser_search",
-                                            status="success" if not err else "error",
-                                            summary=f"已搜索关键词 '{query}'" if not err else res_text[:60],
-                                            data=res_text,
-                                            side_effects="navigation" if not err else "none",
-                                            error=res_text if err else None
-                                        )
-                                    elif func_name == "browser_get_content":
-                                        res_text = await browser_get_content()
-                                        err = is_browser_error(res_text)
-                                        contract = ToolResultContract(
-                                            ok=not err,
-                                            action="browser_get_content",
-                                            status="success" if not err else "error",
-                                            summary="已提取页面内容" if not err else res_text[:60],
-                                            data=res_text,
-                                            error=res_text if err else None
-                                        )
-                                    elif func_name == "browser_list_actions":
-                                        max_items = func_args.get("max_items", 25)
-                                        res_text = await browser_list_actions(max_items=max_items)
-                                        err = is_browser_error(res_text)
-                                        contract = ToolResultContract(
-                                            ok=not err,
-                                            action="browser_list_actions",
-                                            status="success" if not err else "error",
-                                            summary="已获取页面可操作候选项" if not err else res_text[:60],
-                                            data=res_text,
-                                            error=res_text if err else None
-                                        )
-                                    elif func_name == "browser_click":
-                                        target = func_args.get("text", "") or func_args.get("text_or_selector", "") or func_args.get("target", "")
-                                        res_text = await browser_click(target)
-                                        err = is_browser_error(res_text) or ("已成功点击" not in res_text)
-                                        contract = ToolResultContract(
-                                            ok=not err,
-                                            action="browser_click",
-                                            status="success" if not err else "error",
-                                            summary=res_text[:80],
-                                            side_effects="ui_updated" if not err else "none",
-                                            error=res_text if err else None
-                                        )
-                                    elif func_name == "browser_scroll":
-                                        direction = func_args.get("direction", "down")
-                                        res_text = await browser_scroll(direction)
-                                        err = is_browser_error(res_text)
-                                        contract = ToolResultContract(
-                                            ok=not err,
-                                            action="browser_scroll",
-                                            status="success" if not err else "error",
-                                            summary=res_text[:80],
-                                            side_effects="ui_updated" if not err else "none",
-                                            error=res_text if err else None
-                                        )
-                                    else:
-                                        mcp_res = await mcp_session.call_tool(func_name, func_args)
-                                        is_err = bool(getattr(mcp_res, "is_error", False) or getattr(mcp_res, "isError", False))
-                                        texts = []
-                                        for item in mcp_res.content:
-                                            if hasattr(item, "text") and item.text:
-                                                texts.append(item.text)
-                                            elif hasattr(item, "data"):
-                                                texts.append("[截图像素数据已捕获]")
-                                        raw_text = "\n".join(texts) if texts else ("MCP 执行失败" if is_err else "ok")
-                                        cleaned_text = format_tool_result(func_name, raw_text)
-                                        contract = ToolResultContract(
-                                            ok=not is_err,
-                                            action=func_name,
-                                            status="success" if not is_err else "error",
-                                            summary=f"已执行 {func_name}" if not is_err else f"{func_name} 执行失败",
-                                            data=cleaned_text,
-                                            side_effects="ui_updated" if not is_err else "none",
-                                            error=cleaned_text if is_err else None
-                                        )
-                                except Exception as err:
-                                    contract = ToolResultContract(
-                                        ok=False,
-                                        action=func_name,
-                                        status="error",
-                                        summary="执行异常",
-                                        error=str(err)
-                                    )
-
-                                cost_ms = int((time.time() - t_start) * 1000)
-                                log_event("TOOL_RESULT", f"{func_name} ({cost_ms}ms) status={contract.status}")
-                                print(f"✨ [{func_name} 完成] ({cost_ms}ms, {contract.summary[:60]})")
-                                current_tools_executed.append(f"{func_name}: {contract.summary[:60]}")
-
-                                function_responses.append(
-                                    types.FunctionResponse(
-                                        name=func_name,
-                                        id=call.id,
-                                        response={"result": contract.to_gemini_response()}
-                                    )
-                                )
-
-                            await session.send_tool_response(function_responses=function_responses)
-                            log_event("TOOL_RESPONSE_SENT", f"Sent response for {len(function_responses)} calls, waiting for Gemini summary")
-                            has_active_tool = False
-                            waiting_tool_summary = True
-                            set_state(STATE_THINKING)
-
-                        # 4. 轮次终结：沉淀记忆至本地记忆池，平滑回归 LISTENING
+                        # 4. 轮次终结：沉淀记忆至本地记忆池，通过 target_turn_id 隔离旧播放回调
                         if response.server_content and response.server_content.turn_complete:
-                            if not response.tool_call and not has_active_tool and not waiting_tool_summary:
+                            if not response.tool_call and not turn_ctrl.has_active_tool and not turn_ctrl.waiting_tool_summary:
                                 u_txt = " ".join(current_user_transcript).strip()
                                 m_txt = "".join(current_model_transcript).strip()
                                 t_summary = "; ".join(current_tools_executed).strip()
@@ -1185,19 +1243,24 @@ async def run_session(
                                 current_model_transcript = []
                                 current_tools_executed = []
 
-                                async def wait_for_playback_done():
+                                completed_turn_id = turn_ctrl.current_turn_id
+
+                                async def wait_for_playback_done(target_turn_id: int):
                                     wait_start = time.time()
                                     while player.is_busy() and (time.time() - wait_start < 15.0):
                                         await asyncio.sleep(0.05)
                                     await asyncio.sleep(0.1)
+                                    # 隔离保护：仅当仍属于当前轮次且未被打断时，才切换为 LISTENING
+                                    if not turn_ctrl.is_current_turn(target_turn_id) or turn_ctrl.cancellation_token.is_cancelled:
+                                        log_event("DISCARD_OLD_TURN_CALLBACK", f"Turn {target_turn_id} playback callback discarded (current turn is {turn_ctrl.current_turn_id})")
+                                        return
                                     set_state(STATE_LISTENING)
-                                    is_interrupted = False
-                                    active_cancellation_token = CancellationToken(f"turn_{time.time()}")
-                                    log_event("TURN_COMPLETE", "Turn fully finished and playback done, now LISTENING (Persistent session maintained)")
+                                    turn_ctrl.cancellation_token = CancellationToken(f"turn_{time.time()}")
+                                    log_event("TURN_COMPLETE", f"Turn {target_turn_id} fully finished and playback done, now LISTENING")
                                     sys.stdout.write("\n🟢 [\033[1;32m就绪，请说下一句指令...\033[0m]\n")
                                     sys.stdout.flush()
 
-                                asyncio.create_task(wait_for_playback_done())
+                                asyncio.create_task(wait_for_playback_done(completed_turn_id))
 
                     if messages_in_turn == 0 and not shutdown_event.is_set() and not reconnect_event.is_set():
                         await asyncio.sleep(0.05)
@@ -1210,6 +1273,10 @@ async def run_session(
             finally:
                 set_state(STATE_LISTENING)
 
+        current_user_transcript = []
+        current_model_transcript = []
+        current_tools_executed = []
+
         task_send = asyncio.create_task(send_loop())
         task_recv = asyncio.create_task(recv_loop())
         task_watchdog = asyncio.create_task(watchdog_loop())
@@ -1221,11 +1288,16 @@ async def run_session(
             task_send.cancel()
             task_recv.cancel()
             task_watchdog.cancel()
+            if turn_ctrl.active_tool_task and not turn_ctrl.active_tool_task.done():
+                turn_ctrl.active_tool_task.cancel()
             try:
                 mic_stream.stop()
                 mic_stream.close()
             except Exception:
                 pass
+
+        if reconnect_event.is_set():
+            raise ConnectionError("Live 连接断开或触发平滑重连 (reconnect_event)")
 
 
 async def main():
@@ -1394,7 +1466,13 @@ async def main():
                         break
                     except Exception as e:
                         retry_count += 1
-                        jitter = random.uniform(0.1, 0.8)
+                        # 关键修复：当持有 handle 重连失败时，说明服务端会话 handle 已失效，清空 handle 降级为本地上下文记忆回灌
+                        if session_state.get("handle"):
+                            log_event("RESUME_FAILED_FALLBACK", f"Session resume with handle failed: {e}. Clearing handle and falling back to memory injection.")
+                            print("\n⚠️ [官方会话句柄恢复失败，自动清空 Handle 并降级为本地上下文记忆回灌...]", file=sys.stderr)
+                            session_state["handle"] = None
+
+                        jitter = random.uniform(0.2, 0.8)
                         wait_sec = min(30.0, (1.8 ** min(retry_count, 5)) + jitter)
                         log_event("RECONNECT", f"Connection dropped (attempt {retry_count}): {e}, retrying in {wait_sec:.1f}s")
                         print(f"\n⚠️ [连接断开，{wait_sec:.1f}s 后自动重连并恢复记忆 (第 {retry_count} 次)]: {e}", file=sys.stderr)

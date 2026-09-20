@@ -19,9 +19,9 @@ fi
 
 # 优先使用 uv 运行，极速免手动配环境
 if command -v uv >/dev/null 2>&1; then
-    exec uv run "$DIR/gemini_live_cu.py" "$@"
+    exec uv run --locked python "$DIR/gemini_live_cu.py" "$@"
 elif [ -x "$HOME/.local/bin/uv" ]; then
-    exec "$HOME/.local/bin/uv" run "$DIR/gemini_live_cu.py" "$@"
+    exec "$HOME/.local/bin/uv" run --locked python "$DIR/gemini_live_cu.py" "$@"
 else
     # 回退到普通 python3
     if [ ! -d "$DIR/.venv" ]; then
