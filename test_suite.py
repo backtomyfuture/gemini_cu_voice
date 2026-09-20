@@ -206,8 +206,8 @@ async def test_layer_1(report: TestReport, mcp_session):
         report.record("Layer 1", "ego-browser: browser_scroll", False, str(e), cost)
 
 
-async def call_gemini_with_retry(client, model, contents, config, max_retries=3):
-    """带指数退避的 API 请求，应对偶发 503/429 抖动"""
+async def call_gemini_with_retry(client, model, contents, config, max_retries=5):
+    """带自适应退避的 API 请求，优雅应对 429 Rate Limit (Free Tier 5 RPM) 与 503 抖动"""
     last_err = None
     for attempt in range(max_retries):
         try:
@@ -220,7 +220,8 @@ async def call_gemini_with_retry(client, model, contents, config, max_retries=3)
             last_err = e
             err_msg = str(e)
             if any(k in err_msg for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
-                wait_t = 2.0 * (attempt + 1)
+                # 针对 429 每分钟限制，退避等待 4~8 秒以便刷新配额窗口
+                wait_t = (4.0 * (attempt + 1)) if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg) else (2.0 * (attempt + 1))
                 await asyncio.sleep(wait_t)
                 continue
             raise
@@ -296,6 +297,7 @@ async def test_layer_2(report: TestReport, client: genai.Client, all_tools):
         except Exception as e:
             cost = (time.time() - t0) * 1000
             report.record("Layer 2", f"意图识别: '{query}'", False, str(e), cost)
+        await asyncio.sleep(1.0)
 
 
 # ==============================================================================
@@ -365,6 +367,8 @@ async def test_layer_3(report: TestReport, client: genai.Client, all_tools):
     except Exception as e:
         cost = (time.time() - t0) * 1000
         report.record("Layer 3", "E2E闭环: 打开计算器", False, str(e), cost)
+
+    await asyncio.sleep(2.0)
 
     # Case 3.2: 搜索内容 -> 模拟回传网页要点 -> 验证归纳回答
     t0 = time.time()
