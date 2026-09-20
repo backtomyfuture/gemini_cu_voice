@@ -47,46 +47,116 @@ def log_event(category: str, message: str):
     except Exception:
         pass
 
-def clean_ax_text(raw_text: str, max_chars: int = 1800) -> str:
-    """智能清洗 AX 树：提取真正的页面文本、标题和链接，滤除无用布局容器与系统菜单噪声"""
-    header_lines = []
-    meaningful_lines = []
-    ignore_noise = {
-        "后退", "前进", "共享", "添加到阅读列表", "显示侧边栏", "隐藏侧边栏",
-        "标签页概览", "新标签页", "下载项", "起始页", "关闭", "取消", "菜单栏",
-        "Apple", "Safari", "File", "Edit", "View", "History", "Bookmarks", "Develop", "Window", "Help"
-    }
-
-    for line in raw_text.splitlines():
-        s = line.strip()
-        if s.startswith("#") or s.startswith("- app:") or s.startswith("- window_title:"):
-            header_lines.append(s)
-            continue
-        if any(k in s for k in ["AXStaticText", "AXHeading", "AXLink", "AXTitle", "AXValue"]):
-            quotes = re.findall(r'\"([^\"]+)\"', s)
-            for q in quotes:
-                q = q.strip()
-                if len(q) >= 2 and q not in ignore_noise and not q.startswith("http"):
-                    meaningful_lines.append(q)
-            if not quotes and "=" in s:
-                val = s.split("=")[-1].strip()
-                if len(val) >= 2 and val not in ignore_noise and not val.startswith("http"):
-                    meaningful_lines.append(val)
-
-    header = "\n".join(header_lines)
-    unique_lines = list(dict.fromkeys(meaningful_lines))
+def clean_ax_text(raw_text: str, max_chars: int = 5000) -> str:
+    """智能解析并精简 AX 控件树：保留节点编号 [index]、控件角色与标题/内容，过滤系统菜单栏与纯空容器"""
+    header = []
+    lines = raw_text.splitlines()
     
-    if not unique_lines:
-        return (
-            header + "\n\n【提示】：当前应用暂无打开的前台主窗口或未加载出页面正文（仅检测到系统菜单栏）。"
-            "若需打开页面，可调用 press_key 打开新窗口(cmd+n)或新标签(cmd+t)。"
-        )
+    nodes = []
+    node_pattern = re.compile(r'^\s*-\s*\[(\d+)\]\s+(AX\w+)(.*?)$')
+    current_node = None
+    in_menubar = False
+    
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("```"):
+            continue
+            
+        if any(stripped.startswith(prefix) for prefix in ['#', '- app:', '- window_title:', '- bundle_id:']):
+            header.append(stripped)
+            continue
+            
+        m = node_pattern.match(line)
+        if m:
+            if current_node:
+                nodes.append(current_node)
+                current_node = None
+                
+            idx, role, rest = m.groups()
+            if role == 'AXMenuBar':
+                in_menubar = True
+            elif in_menubar and (role == 'AXMenuBarItem' or 'AXMenu' in role):
+                pass
+            else:
+                in_menubar = False
+                current_node = {
+                    'idx': idx,
+                    'role': role,
+                    'lines': [rest]
+                }
+        else:
+            if current_node and not in_menubar:
+                current_node['lines'].append(stripped)
+                
+    if current_node:
+        nodes.append(current_node)
 
-    body = "\n".join(unique_lines)
-    result = header + "\n\n【提取的页面正文与新闻要点】：\n" + body
-    if len(result) > max_chars:
-        result = result[:max_chars] + "\n...(已精简提取)"
-    return result
+    pure_structural = {'AXSplitGroup', 'AXSplitter', 'AXScrollArea', 'AXScrollBar', 'AXGroup', 'AXUnknown'}
+    
+    formatted_items = []
+    for n in nodes:
+        idx = n['idx']
+        role = n['role']
+        full_text = ' '.join(n['lines']).strip()
+        
+        # 移除 actions=[...] 和 @x,y wxh 坐标杂音
+        clean_line = re.sub(r'actions=\[[^\]]*\]', '', full_text)
+        clean_line = re.sub(r'@-?\d+,-?\d+\s+\d+×\d+', '', clean_line)
+        
+        # 提取括号标签 (label)
+        label_match = re.search(r'\(([^)]+)\)', clean_line)
+        label = label_match.group(1).strip() if label_match else ''
+        if label in ['disabled', 'enabled']:
+            label = ''
+            
+        # 提取 = "value"
+        val_match = re.search(r'=\s*\"([^\"]*)\"', clean_line)
+        val = val_match.group(1).strip() if val_match else ''
+        if not val:
+            val_unquoted = re.search(r'=\s*(\S+)', clean_line)
+            if val_unquoted and not val_unquoted.group(1).startswith('actions='):
+                val = val_unquoted.group(1).strip()
+        
+        # 提取末尾的描述文本 "text"
+        clean_text_line = clean_line
+        if label:
+            clean_text_line = clean_text_line.replace(f'({label})', '')
+        if val:
+            clean_text_line = clean_text_line.replace(f'= "{val}"', '').replace(f'={val}', '')
+        
+        help_match = re.search(r'help=\"([^\"]+)\"', clean_text_line)
+        help_text = help_match.group(1).strip() if help_match else ''
+        clean_text_line = re.sub(r'help=\"[^\"]*\"', '', clean_text_line)
+        
+        quotes = re.findall(r'\"([^\"]+)\"', clean_text_line)
+        text = ' | '.join(q.strip() for q in quotes if len(q.strip()) > 0)
+        
+        desc = text or val or label or help_text
+        if role in pure_structural and not desc:
+            continue
+            
+        item_parts = [f"[{idx}]", role]
+        if label:
+            item_parts.append(f"({label})")
+        if val and val != label:
+            item_parts.append(f'= "{val}"')
+        if text and text != label and text != val:
+            t = text.replace('\n', ' ').strip()
+            if len(t) > 130:
+                t = t[:130] + "..."
+            item_parts.append(f'"{t}"')
+        elif not text and not val and help_text and help_text != label:
+            item_parts.append(f'help: "{help_text}"')
+            
+        formatted_items.append(" ".join(item_parts))
+
+    if not formatted_items:
+        return "\n".join(header) + "\n\n【提示】：当前应用暂无打开的前台主窗口或未加载出控件。"
+
+    res = "\n".join(header) + f"\n\n【桌面应用窗口与控件列表（共 {len(formatted_items)} 项）】:\n" + "\n".join(formatted_items)
+    if len(res) > max_chars:
+        res = res[:max_chars] + "\n...(部分控件已精简)"
+    return res
 
 def format_app_list(raw_json: str) -> str:
     """将 list_apps 返回的 JSON 格式化为直观易懂的应用列表"""
@@ -108,7 +178,7 @@ def format_app_list(raw_json: str) -> str:
 def format_tool_result(func_name: str, raw_text: str) -> str:
     """智能分发各工具的输出，杜绝把所有工具误送进 AX 树清洗器"""
     if func_name == "get_app_state":
-        return clean_ax_text(raw_text, max_chars=1800)
+        return clean_ax_text(raw_text, max_chars=4800)
     elif func_name == "list_apps":
         return format_app_list(raw_text)
     else:
@@ -118,7 +188,7 @@ def format_tool_result(func_name: str, raw_text: str) -> str:
         return raw_text if raw_text.strip() else "ok"
 
 def launch_mac_app(app_name: str, bundle_id: str = "") -> str:
-    """原生极速启动/激活 macOS 应用程序"""
+    """原生极速启动并置顶激活 macOS 应用程序"""
     name_map = {
         "计算器": "Calculator",
         "备忘录": "Notes",
@@ -137,6 +207,8 @@ def launch_mac_app(app_name: str, bundle_id: str = "") -> str:
         "提醒事项": "Reminders",
         "系统设置": "System Settings",
         "设置": "System Settings",
+        "outlook": "Microsoft Outlook",
+        "microsoft outlook": "Microsoft Outlook",
     }
     bid_map = {
         "calculator": "com.apple.calculator",
@@ -153,6 +225,8 @@ def launch_mac_app(app_name: str, bundle_id: str = "") -> str:
         "飞书": "com.electron.lark",
         "mail": "com.apple.mail",
         "邮件": "com.apple.mail",
+        "outlook": "com.microsoft.Outlook",
+        "microsoft outlook": "com.microsoft.Outlook",
     }
     
     # 优先 bundle_id
@@ -160,17 +234,30 @@ def launch_mac_app(app_name: str, bundle_id: str = "") -> str:
     if target_bid:
         res = subprocess.run(["open", "-b", target_bid], capture_output=True, text=True)
         if res.returncode == 0:
+            # 强化 AppleScript 前台置顶聚焦，彻底杜绝 occluded 遮挡
+            try:
+                subprocess.run(["osascript", "-e", f'tell application id "{target_bid}" to activate'], capture_output=True, timeout=2)
+            except Exception:
+                pass
             return f"成功打开并激活应用: {app_name} (bundle_id: {target_bid})"
             
     # 其次按映射英文名或原始名打开
     target_name = name_map.get(app_name, app_name)
     res = subprocess.run(["open", "-a", target_name], capture_output=True, text=True)
     if res.returncode == 0:
+        try:
+            subprocess.run(["osascript", "-e", f'tell application "{target_name}" to activate'], capture_output=True, timeout=2)
+        except Exception:
+            pass
         return f"成功打开并激活应用: {target_name}"
         
     # 回退尝试原始中文名
     res2 = subprocess.run(["open", "-a", app_name], capture_output=True, text=True)
     if res2.returncode == 0:
+        try:
+            subprocess.run(["osascript", "-e", f'tell application "{app_name}" to activate'], capture_output=True, timeout=2)
+        except Exception:
+            pass
         return f"成功打开并激活应用: {app_name}"
         
     return f"未能打开应用 '{app_name}': {res.stderr or res2.stderr or '未找到对应应用程序'}"
@@ -229,11 +316,17 @@ SYSTEM_INSTRUCTION = """
 1. 打开任何应用程序（计算器、备忘录、音乐、微信、日历等）：
    - 当用户要求打开软件时，直接调用 open_app(name="应用名")！
    - open_app 执行成功后应用即已在前台。严禁反复用 cmd+space 重试打开！直接向用户简练汇报“已为您打开XXX”。
-2. 计算器操作规范：
+2. 计算器与数学计算规范：
    - 打开计算器后，bundle_id 为 "com.apple.calculator"；
-   - 可以在计算器中输入算式或按键：例如调用 type_text(app="com.apple.calculator", text="128*4=", submit=True)，或通过 press_key 输入按键；
-   - 然后通过 get_app_state 获取显示结果并告知用户。
-3. 网页与搜索操作规范：
+   - 【口语即时汇报计算结果】：你作为先进的智能助手，遇到用户询问数学算式时，打开计算器后应直接在心中算出答案并立即通过语音清晰告知用户（如：“已为您打开计算器，1314 乘以 520 等于 683,280”）；
+   - 【严禁单键循环】：严禁通过 press_key 发起十几次单键逐一按下的低效循环！若需输入，直接使用 type_text 输入数字或点击相应功能按钮。
+3. 邮件客户端（Outlook、邮件）操作规范：
+   - 打开 Outlook 时，调用 open_app(name="Microsoft Outlook") 或 open_app(bundle_id="com.microsoft.Outlook")；
+   - 查收邮件/看最新邮件时，调用 get_app_state(app="com.microsoft.Outlook", mode="ax") 获取收件箱列表；
+   - 控件树中每封邮件表现为带有发件人、主题、日期与正文摘要的 AXRow（附带 [index]）；
+   - 获取到邮件列表后，立即挑出最新的 2-3 封邮件，用简洁亲切的口语向用户播报发件人和主题！
+   - 若用户想看某封具体邮件或点进邮件，直接调用 click(app="com.microsoft.Outlook", index=该邮件行index)，再通过 get_app_state 读取该邮件正文并总结给用户。
+4. 网页与搜索操作规范：
    - 搜资料/查新闻/看网页：直接调用 browser_search(query="关键词") 或 browser_open(url="网址")；
    - 【果断总结，拒绝反复换词搜索】：单次用户提问中，browser_search 最多执行 1 次（特殊情况最多 2 次）。工具一旦返回正文或搜索结果，必须立刻结合已有信息用流畅自然的口语为用户总结核心内容！严禁为了追求所谓完美而连续 3 次以上微调细微关键词反复搜索，避免让用户产生长时间静默等待！
    - 点击网页链接或内容：调用 browser_click(text="要点击的链接文字")；
@@ -376,6 +469,8 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
                 )
             )
         ),
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
         thinking_config=thinking_config,
         tools=[types.Tool(function_declarations=gemini_functions)]
     )
@@ -651,6 +746,21 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
                         is_interrupted = False
                         log_event("SERVER_INTERRUPT", "Server reported interrupted")
 
+                    # 1.5 检查语音实时转录 (用户输入与模型回复)
+                    if response.server_content:
+                        if response.server_content.input_transcription and response.server_content.input_transcription.text:
+                            txt = response.server_content.input_transcription.text.strip()
+                            if txt:
+                                log_event("USER_TRANSCRIPT", txt)
+                                sys.stdout.write(f"\n👤 [\033[1;32m用户语音转录\033[0m] {txt}\n")
+                                sys.stdout.flush()
+                        if response.server_content.output_transcription and response.server_content.output_transcription.text:
+                            txt = response.server_content.output_transcription.text.strip()
+                            if txt:
+                                log_event("MODEL_TRANSCRIPT", txt)
+                                sys.stdout.write(f"\n🤖 [\033[1;36mGemini 播报转录\033[0m] {txt}\n")
+                                sys.stdout.flush()
+
                     # 2. 检查模型语音或文字
                     if response.server_content and response.server_content.model_turn:
                         # 收到模型实际返回（文字或音频），表明工具结果总结正在输出
@@ -685,6 +795,12 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mi
                             if func_name in ["press_key", "type_text", "click"]:
                                 if not func_args.get("app") and not func_args.get("pid"):
                                     func_args["app"] = "com.apple.finder"
+
+                            # 关键防御：防后台 occluded 无法送达按键；get_app_state 强制走极速 ax 控件树
+                            if func_name in ["press_key", "type_text"]:
+                                func_args.setdefault("activate", True)
+                            elif func_name == "get_app_state":
+                                func_args.setdefault("mode", "ax")
 
                             t_start = time.time()
                             try:
