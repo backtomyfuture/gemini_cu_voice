@@ -161,16 +161,18 @@ STATE_SPEAKING = "SPEAKING"    # 扬声器正在平滑播报中
 
 
 def find_audio_devices(preferred_mic="Wireless Mic Rx"):
-    """智能查找麦克风"""
+    """智能查找麦克风，自动检测支持的通道数"""
     devices = sd.query_devices()
     mic_idx = None
     mic_name = "系统默认麦克风"
+    channels = 1
     
     for idx, d in enumerate(devices):
         if d.get("max_input_channels", 0) > 0:
             if preferred_mic.lower() in d.get("name", "").lower():
                 mic_idx = idx
                 mic_name = d["name"]
+                channels = min(2, d.get("max_input_channels", 1))
                 break
                 
     if mic_idx is None:
@@ -178,11 +180,13 @@ def find_audio_devices(preferred_mic="Wireless Mic Rx"):
         if default_in is not None and default_in >= 0:
             mic_idx = default_in
             mic_name = devices[default_in]["name"]
+            channels = min(2, devices[default_in].get("max_input_channels", 1))
         else:
             mic_idx = 0
             mic_name = devices[0]["name"]
+            channels = min(2, devices[0].get("max_input_channels", 1))
             
-    return mic_idx, mic_name
+    return mic_idx, mic_name, channels
 
 
 class SmoothAudioPlayer:
@@ -252,7 +256,7 @@ class SmoothAudioPlayer:
         self.thread.join(timeout=0.5)
 
 
-async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mcp_session, gemini_functions, player, shutdown_event, user_threshold=None):
+async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mic_channels, mcp_session, gemini_functions, player, shutdown_event, user_threshold=None):
     """单个全双工会话生命周期（智能双门限近场语音门控 + 状态严密闭环 + 看门狗超时自愈）"""
     client = genai.Client(api_key=api_key)
 
@@ -282,15 +286,15 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mc
     turn_queue = asyncio.Queue()
     reconnect_event = asyncio.Event()
 
-    # 近场降噪门限参数
-    START_THRESHOLD = user_threshold or 380  # 佩戴者起呼门限（默认 380，远高于环境底噪）
-    HOLD_THRESHOLD = 160                     # 语音维持门限（保护句尾弱音）
-    ATTACK_FRAMES = 3                        # 必须连续 3 帧（~190ms）超门限才判定为真实人声（拦截单帧脉冲杂音）
-    SILENCE_CHUNKS = 14                      # 停顿检测帧数 (~0.9秒判定说话结束)
-    INTERRUPT_RMS = 480                      # 强行打断门限
-    MIN_PEAK_RMS = 450                       # 佩戴者近场说话必须达到的峰值（拦截远场闲聊）
-    MIN_DURATION = 0.6                       # 最短有效说话时长（拦截短促杂音）
-    MIN_VOICED_RATIO = 0.20                  # 有效高能帧比例
+    # 近场降噪门限参数 (初始安全基准值，稍后由现场底噪校准自动自适应)
+    START_THRESHOLD = user_threshold or 110  # 佩戴者起呼门限（默认110，轻声也能灵敏唤醒）
+    HOLD_THRESHOLD = 50                      # 语音维持门限（保护句尾弱音）
+    ATTACK_FRAMES = 2                        # 连续 2 帧（~128ms）超门限即确认（过滤瞬时单帧尖峰，人声即刻唤醒）
+    SILENCE_CHUNKS = 13                      # 停顿检测帧数 (~0.85秒判定说话结束)
+    INTERRUPT_RMS = 240                      # 强行打断门限
+    MIN_PEAK_RMS = 95                        # 说话整句必须达到的峰值（拦截微弱环境底噪漂移）
+    MIN_DURATION = 0.35                      # 最短有效说话时长（支持简短指令）
+    MIN_VOICED_RATIO = 0.05                  # 有效高能帧比例 (5%即可，支持轻音指令)
 
     audio_buffer = []
     rms_history = []
@@ -301,6 +305,7 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mc
     interrupt_frames = 0
     is_ready_to_listen = False
     has_active_tool = False
+    waiting_tool_summary = False
     calib_samples = []
 
     def set_state(new_state):
@@ -312,24 +317,43 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mc
             log_event("STATE", f"Transitioned to {new_state}")
 
     def mic_callback(indata, frames, time_info, status):
-        nonlocal is_speaking, attack_count, silence_count, audio_buffer, rms_history, state, interrupt_frames, START_THRESHOLD, HOLD_THRESHOLD
+        nonlocal is_speaking, attack_count, silence_count, audio_buffer, rms_history, state, interrupt_frames, START_THRESHOLD, HOLD_THRESHOLD, MIN_PEAK_RMS, INTERRUPT_RMS
         
-        samples = np.frombuffer(indata, dtype=np.int16)
-        rms = int(np.sqrt(np.mean(samples.astype(np.float32)**2)))
-        raw_bytes = bytes(indata)
+        # 1. 通道解包与单/双发射器智能混音
+        if mic_channels == 2:
+            stereo = np.frombuffer(indata, dtype=np.int16).reshape(-1, 2)
+            ch0 = stereo[:, 0]
+            ch1 = stereo[:, 1]
+            rms0 = int(np.sqrt(np.mean(ch0.astype(np.float32)**2)))
+            rms1 = int(np.sqrt(np.mean(ch1.astype(np.float32)**2)))
+            # 无线领夹麦智能适配：若某个声道显著更响（如只开了一个发射器），取该通道避免除以2音量损失
+            if rms0 > rms1 * 1.8 and rms0 > 25:
+                mono_samples = ch0
+                rms = rms0
+            elif rms1 > rms0 * 1.8 and rms1 > 25:
+                mono_samples = ch1
+                rms = rms1
+            else:
+                mono_samples = ((ch0.astype(np.int32) + ch1.astype(np.int32)) // 2).astype(np.int16)
+                rms = max(rms0, rms1)
+            raw_bytes = mono_samples.tobytes()
+        else:
+            mono_samples = np.frombuffer(indata, dtype=np.int16)
+            rms = int(np.sqrt(np.mean(mono_samples.astype(np.float32)**2)))
+            raw_bytes = bytes(indata)
 
         # 启动自适应校准底噪（前 1.0 秒）
         if not is_ready_to_listen:
             calib_samples.append(rms)
             return
 
-        bars = "▇" * min(12, rms // 40) + "░" * max(0, 12 - rms // 40)
+        bars = "▇" * min(12, rms // 30) + "░" * max(0, 12 - rms // 30)
 
-        # 1. 扬声器播报中：防回声，需连续 4 帧大声打断
+        # 1. 扬声器播报中：防回声，需连续 3 帧大声打断
         if state == STATE_SPEAKING:
             if rms >= INTERRUPT_RMS:
                 interrupt_frames += 1
-                if interrupt_frames >= 4:
+                if interrupt_frames >= 3:
                     player.interrupt()
                     set_state(STATE_LISTENING)
                     is_speaking = True
@@ -356,7 +380,7 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mc
         if state == STATE_THINKING:
             if rms >= INTERRUPT_RMS:
                 interrupt_frames += 1
-                if interrupt_frames >= 5:
+                if interrupt_frames >= 4:
                     set_state(STATE_LISTENING)
                     is_speaking = True
                     audio_buffer = [raw_bytes]
@@ -390,7 +414,11 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mc
             else:
                 attack_count = 0
                 pre_roll.append((raw_bytes, rms))
-                sys.stdout.write(f"\r🎤 [\033[90m监听中 (过滤远场杂音)\033[0m] 音量: |{bars}| ({rms:3d}/{START_THRESHOLD}) ")
+                # 当有微弱声音但未达起呼门限时，给出友好的实时反馈
+                if rms >= max(35, int(START_THRESHOLD * 0.55)):
+                    sys.stdout.write(f"\r🎤 [\033[93m收音中\033[0m] 音量: |{bars}| ({rms:3d}/{START_THRESHOLD}) ")
+                else:
+                    sys.stdout.write(f"\r🎤 [\033[90m监听中\033[0m] 音量: |{bars}| ({rms:3d}/{START_THRESHOLD}) ")
                 sys.stdout.flush()
         else:
             # 处于说话状态中：使用更宽容的 HOLD_THRESHOLD 保护句尾弱音与轻声字
@@ -419,10 +447,10 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mc
                     silence_count = 0
                     attack_count = 0
 
-                    # 智能语音质量过滤：拦截远场闲聊、咳嗽、衣服摩擦等非用户意图指令
+                    # 智能语音质量过滤：拦截极微弱的环境底噪晃动
                     if dur_sec < MIN_DURATION or peak_rms < MIN_PEAK_RMS or voiced_ratio < MIN_VOICED_RATIO:
-                        log_event("NOISE_REJECTED", f"dur={dur_sec:.2f}s, peak={peak_rms}, voiced={voiced_ratio:.2f}")
-                        sys.stdout.write(f"\r🔇 [\033[90m已智能拦截背景杂音 (峰值:{peak_rms}，时长:{dur_sec:.1f}s)，未触发\033[0m]                       \n")
+                        log_event("NOISE_REJECTED", f"dur={dur_sec:.2f}s, peak={peak_rms}, voiced={voiced_ratio:.2f}, threshold={START_THRESHOLD}")
+                        sys.stdout.write(f"\r🔇 [\033[90m已过滤微弱背景声 (峰值:{peak_rms}/{MIN_PEAK_RMS}，时长:{dur_sec:.1f}s)\033[0m]                       \n")
                         sys.stdout.flush()
                         return
 
@@ -439,7 +467,7 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mc
 
         mic_stream = sd.RawInputStream(
             samplerate=MIC_RATE,
-            channels=1,
+            channels=mic_channels,
             dtype="int16",
             blocksize=CHUNK_SIZE,
             device=mic_idx,
@@ -447,31 +475,37 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mc
         )
         mic_stream.start()
 
-        # 采集 1.0 秒现场底噪并自适应门限
-        await asyncio.sleep(1.0)
+        # 采集 1.2 秒现场底噪（丢弃前 0.3 秒硬件开关冲击声），精确计算本底噪声
+        await asyncio.sleep(1.2)
         if not user_threshold and calib_samples:
-            noise_p95 = int(np.percentile(calib_samples, 95))
-            START_THRESHOLD = max(350, int(noise_p95 * 3.5))
-            HOLD_THRESHOLD = max(140, int(noise_p95 * 1.6))
-            log_event("CALIBRATION", f"Noise floor p95={noise_p95}, start_threshold={START_THRESHOLD}, hold_threshold={HOLD_THRESHOLD}")
+            warm_samples = calib_samples[5:] if len(calib_samples) > 8 else calib_samples
+            noise_median = int(np.median(warm_samples))
+            noise_p75 = int(np.percentile(warm_samples, 75))
+            noise_mean = int(np.mean(warm_samples))
+            # 使用 P75 作为稳健底噪估计（彻底抵御开机碰触尖峰，真实反映底噪）
+            base_noise = noise_p75
+            START_THRESHOLD = max(65, min(160, int(base_noise * 1.7 + 25)))
+            HOLD_THRESHOLD = max(35, min(90, int(base_noise * 1.1 + 10)))
+            MIN_PEAK_RMS = max(75, int(START_THRESHOLD * 1.15))
+            INTERRUPT_RMS = max(160, int(START_THRESHOLD * 1.7))
+            log_event("CALIBRATION", f"Noise floor median={noise_median}, mean={noise_mean}, p75={noise_p75}, start_threshold={START_THRESHOLD}, hold_threshold={HOLD_THRESHOLD}, min_peak={MIN_PEAK_RMS}")
 
         is_ready_to_listen = True
 
-        sys.stdout.write(f"\r🟢 [\033[1;32m连接就绪，请直接对麦克风说话\033[0m] (近场起呼门限: {START_THRESHOLD})                 \n")
+        sys.stdout.write(f"\r🟢 [\033[1;32m连接就绪，请直接对麦克风说话\033[0m] (起呼门限: {START_THRESHOLD}, 维持门限: {HOLD_THRESHOLD})                 \n")
         sys.stdout.flush()
 
-        # 【保姆式看门狗自愈】：如果在非空闲状态且扬声器未在播放，超过 7.5 秒毫无响应，自动重建健康连接
+        # 【保姆式看门狗自愈】：如果在非空闲状态且扬声器未在播放，超过 25.0 秒毫无响应，自动恢复空闲监听
         async def watchdog_loop():
             while not shutdown_event.is_set() and not reconnect_event.is_set():
                 await asyncio.sleep(1.0)
                 if state in [STATE_THINKING, STATE_EXECUTING] and not player.is_busy():
                     idle_sec = time.time() - state_start_time
-                    if idle_sec > 7.5:
-                        log_event("WATCHDOG_RECONNECT", f"Server/tool unresponsive for {idle_sec:.1f}s, triggering auto-reconnect")
-                        sys.stdout.write("\n⚠️ [\033[1;33m服务端响应超时，正在自动恢复健康连接...\033[0m]\n")
+                    if idle_sec > 25.0:
+                        log_event("WATCHDOG_TIMEOUT", f"Server/tool unresponsive for {idle_sec:.1f}s, recovering to LISTENING")
+                        sys.stdout.write("\n⚠️ [\033[1;33m响应超时，已自动恢复待命状态，请重新说话...\033[0m]\n")
                         sys.stdout.flush()
-                        reconnect_event.set()
-                        break
+                        set_state(STATE_LISTENING)
 
         async def send_loop():
             try:
@@ -497,7 +531,7 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mc
                 log_event("SEND_ERROR", str(e))
 
         async def recv_loop():
-            nonlocal state, has_active_tool
+            nonlocal state, has_active_tool, waiting_tool_summary
             try:
                 while not shutdown_event.is_set() and not reconnect_event.is_set():
                     response = await session._receive()
@@ -509,10 +543,13 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mc
                         player.interrupt()
                         set_state(STATE_LISTENING)
                         has_active_tool = False
+                        waiting_tool_summary = False
                         log_event("SERVER_INTERRUPT", "Server reported interrupted")
 
                     # 2. 检查模型语音或文字
                     if response.server_content and response.server_content.model_turn:
+                        # 收到模型实际返回（文字或音频），表明工具结果总结正在输出
+                        waiting_tool_summary = False
                         for part in response.server_content.model_turn.parts:
                             if part.text:
                                 if getattr(part, "thought", False):
@@ -529,6 +566,7 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mc
                     # 3. 检查工具调用请求（100% 走 kimi-cu MCP）
                     if response.tool_call:
                         has_active_tool = True
+                        waiting_tool_summary = False
                         set_state(STATE_EXECUTING)
                         function_responses = []
                         for call in response.tool_call.function_calls:
@@ -572,19 +610,19 @@ async def run_session(api_key, selected_model, voice_name, mic_idx, mic_name, mc
 
                         await session.send_tool_response(function_responses=function_responses)
                         log_event("TOOL_RESPONSE_SENT", f"Sent response for {len(function_responses)} calls, waiting for Gemini summary")
-                        # 工具发回后，状态必须转为 THINKING 等待模型口头总结，严禁切为 LISTENING
+                        # 工具发回后，标记等待口头总结，切为 THINKING，严禁被并发 turn_complete 误杀
+                        has_active_tool = False
+                        waiting_tool_summary = True
                         set_state(STATE_THINKING)
 
-                    # 4. 轮次终结：仅当没有未完成的工具调用且模型真正回复完、播放器彻底播完后才回到 LISTENING
+                    # 4. 轮次终结：仅当没有未完成的工具调用、且不在等待工具总结、且播放器彻底播完后才回到 LISTENING
                     if response.server_content and response.server_content.turn_complete:
-                        if not response.tool_call:
+                        if not response.tool_call and not has_active_tool and not waiting_tool_summary:
                             async def wait_for_playback_done():
-                                nonlocal has_active_tool
                                 wait_start = time.time()
                                 while player.is_busy() and (time.time() - wait_start < 15.0):
                                     await asyncio.sleep(0.05)
                                 await asyncio.sleep(0.1)
-                                has_active_tool = False
                                 set_state(STATE_LISTENING)
                                 log_event("TURN_COMPLETE", "Turn fully finished and playback done, now LISTENING")
                                 sys.stdout.write("\n🟢 [\033[1;32m就绪，请说下一句指令...\033[0m]\n")
@@ -639,7 +677,7 @@ async def main():
         "--threshold",
         type=int,
         default=int(os.environ.get("MIC_THRESHOLD", 0)) or None,
-        help="近场说话起呼门限 RMS（默认自动根据底噪自适应，通常 350~450；调高更防杂音，调低更灵敏）"
+        help="近场说话起呼门限 RMS（默认自动根据底噪自适应，通常 80~150；调高更防杂音，调低更灵敏）"
     )
     parser.add_argument(
         "--voice",
@@ -650,15 +688,15 @@ async def main():
     args = parser.parse_args()
 
     selected_model = MODEL_THINKING if args.thinking else args.model
-    mic_idx, mic_name = find_audio_devices(args.mic)
+    mic_idx, mic_name, mic_channels = find_audio_devices(args.mic)
     kimi_cu_path = os.environ.get("KIMI_CU_PATH", "/Applications/KimiCU.app/Contents/MacOS/kimi-cu")
 
-    log_event("STARTUP", f"Starting service with model={selected_model}, mic={mic_name}, threshold={args.threshold}, voice={args.voice}")
+    log_event("STARTUP", f"Starting service with model={selected_model}, mic={mic_name} (ch={mic_channels}), threshold={args.threshold}, voice={args.voice}")
 
     print("=" * 68)
     print("🎙️   Gemini 3.8 Live + kimi-cu 纯原生 MCP 实时语音桌面操作管家")
     print(f"🤖  当前模型: \033[1;36m{selected_model}\033[0m")
-    print(f"🎤  输入麦克风: \033[1;32m[{mic_idx}] {mic_name}\033[0m")
+    print(f"🎤  输入麦克风: \033[1;32m[{mic_idx}] {mic_name} ({mic_channels}通道)\033[0m")
     if args.threshold:
         print(f"🎯  降噪门限: \033[1;33m固定近场门限 RMS={args.threshold}\033[0m (拦截远场闲聊与环境杂音)")
     else:
@@ -683,7 +721,8 @@ async def main():
             f.write(f"GEMINI_API_KEY={api_key}\n")
             f.write(f"GEMINI_LIVE_MODEL={selected_model}\n")
             f.write(f"PREFER_MIC={args.mic}\n")
-            f.write(f"MIC_THRESHOLD={args.threshold or 380}\n")
+            if args.threshold:
+                f.write(f"MIC_THRESHOLD={args.threshold}\n")
             f.write(f"GEMINI_VOICE={args.voice}\n")
 
     if not os.path.exists(kimi_cu_path):
@@ -730,6 +769,7 @@ async def main():
                             voice_name=args.voice,
                             mic_idx=mic_idx,
                             mic_name=mic_name,
+                            mic_channels=mic_channels,
                             mcp_session=mcp_session,
                             gemini_functions=gemini_functions,
                             player=player,
