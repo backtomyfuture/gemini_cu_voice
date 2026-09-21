@@ -64,3 +64,57 @@ uv run --locked python gemini_live_cu.py
 - *"在地址栏输入 ithome.com 并回车"*
 - *"总结一下当前网页的内容"*
 - *"帮我打开微信"*
+
+---
+
+## 自动化测试套件（深度闭环与真实 PCM 语音驱动）
+
+本项目配备了工业级多层级自动化测试套件 `test_suite.py`，**支持使用真实的 16kHz 16-bit PCM 语音数据直接传递给 Gemini 驱动执行，拒绝单一脚本文本触发，并实现所有应用全流程深度交互闭环**。
+
+### 测试架构四层分级：
+- **Layer 0：安全执行策略与治理规则单元测试** (20 项测试全部通过)
+  - 覆盖只读放行、高危按键阻断、Prompt 注入防御、打断令牌流控、单轮预算上限、重复调用抑制、浏览器子进程超时强杀与幽灵数据阻断等。
+- **Layer 1：真实应用深度闭环基座测试 (Deep Closed-Loop Integration)**
+  - **Outlook 邮件闭环**：打开 Outlook -> 查看到第一封邮件 -> 点开第一封邮件 -> 提取主题、发件人及正文摘要并完整反馈。
+  - **Word 文档闭环**：打开 Word -> 新建空白文档 -> 键入文字 -> 保存到登录用户的下载文件夹 (`~/Downloads/*.docx`) -> 验证文件存在且大小有效 -> 关闭 Word -> 从下载文件夹彻底删除该文件 -> 验证完全清理。
+  - **计算器闭环**：打开计算器 -> 动态识别并点击无障碍按钮运算 `8 × 9` -> 读取界面实际显示结果 `72` -> 退出关闭应用。
+  - **Ego 浏览器闭环**：打开资讯网站 -> 提取候选编号清单 `[#1]` -> 精准点击第一篇新闻 -> 详情页抓取完整正文并反馈。
+  - **备忘录闭环**：打开备忘录 -> 新建笔记并录入内容 -> 读取验证 -> 彻底清理删除该测试笔记并退出。
+  - **系统应用管理**：扫描全部运行中应用并置顶聚焦。
+- **Layer 2：真实 PCM 语音端到端全链路闭环评测 (Real Voice-Driven E2E)**
+  - 使用 macOS 高品质真实人声合成（或外部录音 WAV/PCM 文件、麦克风现场录音）打包为标准 16kHz 16-bit 单声道二进制语音流；
+  - 语音数据直接传递给 Gemini 智能体，模型通过听音识别用户意图并下发工具动作；
+  - 底层自动化执行器完成真实深度闭环操作，并将执行结果回灌给模型；
+  - 模型根据实际内容生成最终中文口语汇报，实现“真实声音输入 -> 动作闭环 -> 结果口语反馈”的全链路贯通。
+- **Layer 3：硬件音频与近场 VAD 门控健康检查**
+  - 检查麦克风识别、双声道/单声道采集、底噪 RMS、自适应起呼门限与维持门限健康度。
+
+### 测试套件常用运行命令：
+
+```bash
+# 1. 运行全套完整自动化测试 (Layer 0 ~ Layer 3)
+uv run python test_suite.py
+
+# 2. 仅运行指定层级测试
+uv run python test_suite.py --layer 0    # 极速安全策略单测 (20项)
+uv run python test_suite.py --layer 1    # 真实应用深度闭环基座测试
+uv run python test_suite.py --layer 2    # 真实 PCM 语音驱动端到端全链路评测
+uv run python test_suite.py --layer 3    # 硬件麦克风与自适应 VAD 健康度检查
+
+# 3. 单独测试特定深度闭环用例 (秒级执行)
+uv run python test_suite.py --case outlook    # 单测 Outlook 邮件查收、点开与内容读取
+uv run python test_suite.py --case word       # 单测 Word 键入、保存下载文件夹与删除清理
+uv run python test_suite.py --case calc       # 单测 计算器按钮点击运算与结果读取
+uv run python test_suite.py --case browser    # 单测 浏览器候选点击与正文下钻抓取
+uv run python test_suite.py --case notes      # 单测 备忘录新建、读取与清理
+
+# 4. 自定义真实语音指令驱动实测
+uv run python test_suite.py --voice-query "帮我打开Outlook查看第一封邮件"
+
+# 5. 使用外部真实 WAV/PCM 录音文件驱动测试
+uv run python test_suite.py --audio-file /path/to/my_voice.wav
+
+# 6. 现场按键从麦克风录音驱动测试
+uv run python test_suite.py --record-voice
+```
+

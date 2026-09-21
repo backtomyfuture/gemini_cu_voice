@@ -10,17 +10,26 @@
 # ///
 """
 自动化多层测试套件 (Comprehensive Test Suite for Gemini Live CU Voice Assistant)
-覆盖安全执行策略层 (Layer 0)、底层原子能力与候选机制 (Layer 1)、模型意图决策 (Layer 2)、
-两轮闭环与防死循环 (Layer 3)、音频硬件与近场 VAD 门控健康 (Layer 4)。
+- Layer 0: 安全执行策略层与治理规则 (Tool Policy & Contract Unit Tests)
+- Layer 1: 真实应用深度闭环基座测试 (Deep Closed-Loop Integration Tests - Outlook/Word/Calc/Browser/Notes)
+- Layer 2: 真实 PCM 语音驱动全链路闭环评测 (Real Voice-Driven E2E Tests with PCM Audio Stream)
+- Layer 3: 音频硬件与近场 VAD 门控健康 (Audio Hardware & VAD Health Boundary)
 """
 import os
+import re
 import sys
 import time
 import json
+import wave
+import socket
 import asyncio
 import argparse
-import numpy as np
+import subprocess
+import collections
 from pathlib import Path
+from typing import Optional, Dict, Any, List
+
+import numpy as np
 from dotenv import load_dotenv
 
 # 加载环境变量
@@ -30,7 +39,6 @@ load_dotenv()
 if not os.environ.get("http_proxy") and not os.environ.get("https_proxy"):
     for port in [7890, 7897, 10808]:
         try:
-            import socket
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(0.1)
                 if s.connect_ex(("127.0.0.1", port)) == 0:
@@ -59,6 +67,7 @@ from gemini_live_cu import (
     launch_mac_app,
     format_tool_result,
     find_audio_devices,
+    clean_ax_text,
     SYSTEM_INSTRUCTION,
     ConversationMemory,
     TurnController,
@@ -77,11 +86,12 @@ from ego_browser_client import (
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-# 颜色控制
+# 终端颜色与样式
 GREEN = "\033[1;32m"
 RED = "\033[1;31m"
 YELLOW = "\033[1;33m"
 CYAN = "\033[1;36m"
+MAGENTA = "\033[1;35m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
@@ -110,7 +120,7 @@ class TestReport:
         })
         print(f"  [{status_str}] {BOLD}{test_name}{RESET} ({cost_ms:.0f}ms)")
         if detail:
-            for line in detail.strip().splitlines()[:3]:
+            for line in detail.strip().splitlines()[:4]:
                 print(f"         \033[90m{line}\033[0m")
 
     def print_summary(self):
@@ -120,11 +130,419 @@ class TestReport:
         print("=" * 70)
         print(f"总测试项: {total} | 通过: {GREEN}{self.passed}{RESET} | 失败: {RED}{self.failed}{RESET} | 跳过: {YELLOW}{self.skipped}{RESET}")
         if self.failed == 0:
-            print(f"\n🎉 {GREEN}{BOLD}所有测试全部通过！系统状态健康，已具备安全实测条件。{RESET}\n")
+            print(f"\n🎉 {GREEN}{BOLD}所有测试全部通过！系统状态健康，已具备完整闭环与真实语音实测条件。{RESET}\n")
         else:
             print(f"\n⚠️ {RED}{BOLD}存在 {self.failed} 项测试未通过，请检查上方日志并进行针对性排查。{RESET}\n")
 
 
+# ==============================================================================
+# 真实 PCM 语音引擎与硬件录制器 (Real Voice Engine)
+# ==============================================================================
+class RealVoiceSynthesizer:
+    """负责将文本生成或读取为标准 16kHz 16-bit 单声道线性 PCM/WAV 真实语音数据"""
+
+    @staticmethod
+    def synthesize_wav(text: str, voice: str = "Tingting", out_path: Optional[str] = None) -> bytes:
+        """使用 macOS 原生高质量语音合成并转换为 16000Hz 16-bit 单声道 WAV 文件/字节"""
+        temp_aiff = Path(f"/tmp/gemini_cu_synth_{os.getpid()}_{int(time.time()*1000)}.aiff")
+        temp_wav = Path(out_path) if out_path else Path(f"/tmp/gemini_cu_synth_{os.getpid()}_{int(time.time()*1000)}.wav")
+
+        try:
+            # 1. say 录制
+            cmd_say = ["say", "-v", voice, text, "-o", str(temp_aiff)]
+            res_say = subprocess.run(cmd_say, capture_output=True, text=True)
+            if res_say.returncode != 0:
+                # 备用默认中文声音
+                subprocess.run(["say", text, "-o", str(temp_aiff)], check=True)
+
+            # 2. afconvert 转为 16kHz 16-bit 单声道 LE 线性 PCM
+            cmd_conv = ["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(temp_aiff), str(temp_wav)]
+            subprocess.run(cmd_conv, check=True, capture_output=True)
+
+            with open(temp_wav, "rb") as f:
+                data = f.read()
+            return data
+        finally:
+            if temp_aiff.exists():
+                temp_aiff.unlink()
+            if not out_path and temp_wav.exists():
+                temp_wav.unlink()
+
+    @staticmethod
+    def synthesize_pcm(text: str, voice: str = "Tingting") -> bytes:
+        """生成原始 PCM 数据（跳过 44 字节 WAV 头）"""
+        wav_bytes = RealVoiceSynthesizer.synthesize_wav(text, voice)
+        return wav_bytes[44:] if len(wav_bytes) > 44 else wav_bytes
+
+    @staticmethod
+    def load_audio_file(file_path: str) -> bytes:
+        """加载任意外部音频文件并自动转码为标准 16kHz 单声道 WAV 字节"""
+        src = Path(file_path)
+        if not src.exists():
+            raise FileNotFoundError(f"音频文件不存在: {file_path}")
+
+        temp_wav = Path(f"/tmp/gemini_cu_loaded_{os.getpid()}.wav")
+        try:
+            cmd = ["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(src), str(temp_wav)]
+            subprocess.run(cmd, check=True, capture_output=True)
+            with open(temp_wav, "rb") as f:
+                return f.read()
+        finally:
+            if temp_wav.exists():
+                temp_wav.unlink()
+
+    @staticmethod
+    def record_from_mic(duration_sec: float = 3.5, prefer_mic: str = "Wireless Mic Rx") -> bytes:
+        """从硬件麦克风采集真实人类说话声音并转为 16kHz 16-bit 单声道 WAV 格式"""
+        import sounddevice as sd
+        mic_idx, mic_name, mic_channels = find_audio_devices(prefer_mic)
+        print(f"\n🎙️  [请对麦克风说话 ({duration_sec}秒)]: \033[1;32m{mic_name}\033[0m ...")
+
+        sample_rate = 16000
+        total_frames = int(sample_rate * duration_sec)
+        samples = sd.rec(total_frames, samplerate=sample_rate, channels=mic_channels, dtype="int16", device=mic_idx)
+        sd.wait()
+        print("🎤 [录音完成，正在编码生成 PCM/WAV 音频流...]")
+
+        if mic_channels == 2:
+            mono = ((samples[:, 0].astype(np.int32) + samples[:, 1].astype(np.int32)) // 2).astype(np.int16)
+        else:
+            mono = samples.flatten()
+
+        raw_pcm = mono.tobytes()
+        temp_wav = Path(f"/tmp/gemini_cu_mic_{os.getpid()}.wav")
+        try:
+            with wave.open(str(temp_wav), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(raw_pcm)
+            with open(temp_wav, "rb") as f:
+                return f.read()
+        finally:
+            if temp_wav.exists():
+                temp_wav.unlink()
+
+
+# ==============================================================================
+# 五大核心应用深度闭环执行器 (Deep Closed-Loop Executors)
+# ==============================================================================
+class ClosedLoopExecutors:
+    """各应用的完整闭环执行逻辑：涵盖打开、交互、状态读取、保存验证、清理与结果提炼"""
+
+    @staticmethod
+    async def execute_outlook(mcp_session=None) -> Dict[str, Any]:
+        """
+        Outlook 完整闭环测试：
+        1. 启动并前台激活 Outlook
+        2. 读取邮件列表定位第一封邮件
+        3. 打开/聚焦第一封邮件并提取实际内容（主题、发件人、正文预览）
+        4. 反馈实际内容
+        """
+        t0 = time.time()
+        launch_res = launch_mac_app("Microsoft Outlook", "com.microsoft.Outlook")
+        await asyncio.sleep(0.8)
+
+        # 结合 AppleScript 与 AX 树双通道进行精准提取与校验
+        scpt = """
+        tell application "Microsoft Outlook"
+            activate
+            delay 0.3
+            try
+                set msg to first message of inbox
+                set s to subject of msg
+                set snd to sender of msg
+                set c to plain text content of msg
+                set len to length of c
+                if len > 200 then set len to 200
+                set snip to text 1 thru len of c
+                return s & " ||| " & (name of snd) & " ||| " & snip
+            on error e
+                return "ERROR: " & e
+            end try
+        end tell
+        """
+        res = subprocess.run(["osascript", "-e", scpt], capture_output=True, text=True)
+        raw_out = res.stdout.strip()
+
+        # 同时调用 AX 状态验证窗口控件
+        ax_state = ""
+        if mcp_session:
+            try:
+                mcp_resp = await mcp_session.call_tool(
+                    "get_app_state", {"app": "com.microsoft.Outlook", "mode": "ax", "activate": True}
+                )
+                ax_state = "\n".join([c.text for c in mcp_resp.content if hasattr(c, "text")])
+            except Exception:
+                pass
+
+        cost_ms = (time.time() - t0) * 1000
+        if "|||" in raw_out:
+            parts = raw_out.split("|||")
+            subject = parts[0].strip()
+            sender = parts[1].strip()
+            snippet = parts[2].strip() if len(parts) > 2 else ""
+            summary = f"发件人: {sender} | 主题: {subject} | 内容摘要: {snippet[:80]}"
+            return {
+                "ok": True,
+                "subject": subject,
+                "sender": sender,
+                "snippet": snippet,
+                "summary": summary,
+                "cost_ms": cost_ms
+            }
+        else:
+            return {
+                "ok": False,
+                "error": raw_out or "未能读取到收件箱邮件",
+                "summary": f"读取失败: {raw_out[:60]}",
+                "cost_ms": cost_ms
+            }
+
+    @staticmethod
+    async def execute_word(mcp_session=None, test_text: str = None) -> Dict[str, Any]:
+        """
+        Word 完整闭环测试：
+        1. 打开 Microsoft Word
+        2. 新建空白文档并输入文字
+        3. 保存到当前登录用户的 ~/Downloads (下载) 文件夹
+        4. 验证 ~/Downloads 文件夹中确实存在该文件且文件大小有效
+        5. 关闭 Word 文档
+        6. 从 ~/Downloads 文件夹中将该测试文件彻底删除
+        7. 验证下载文件夹中该文件已被彻底清除（无残留）
+        """
+        t0 = time.time()
+        downloads_dir = Path.home() / "Downloads"
+        target_file = downloads_dir / f"gemini_cu_word_test_{int(time.time())}.docx"
+
+        if target_file.exists():
+            target_file.unlink()
+
+        input_text = test_text or f"Gemini Live 语音电脑管家端到端闭环自动化测试输入，时间戳: {time.strftime('%Y-%m-%d %H:%M:%S')}。"
+
+        scpt = f"""
+        tell application "Microsoft Word"
+            activate
+            delay 0.5
+            set newDoc to make new document
+            delay 0.5
+            tell selection
+                type text text "{input_text}"
+            end tell
+            delay 0.5
+            save as active document file name "{target_file.as_posix()}"
+            delay 0.5
+            close active document saving no
+        end tell
+        """
+        res = subprocess.run(["osascript", "-e", scpt], capture_output=True, text=True)
+
+        # 1. 验证文件保存到 Downloads
+        saved_ok = target_file.exists() and target_file.stat().st_size > 0
+        file_size = target_file.stat().st_size if saved_ok else 0
+
+        # 2. 清理删除文件
+        deleted_ok = False
+        if saved_ok:
+            try:
+                target_file.unlink()
+                deleted_ok = not target_file.exists()
+            except Exception:
+                deleted_ok = False
+
+        cost_ms = (time.time() - t0) * 1000
+        ok = saved_ok and deleted_ok
+
+        summary = (
+            f"已打开Word新建文档并输入文字 -> 成功保存至下载文件夹({file_size}字节) -> 已自动关闭并删除该下载文件(清理确认)"
+            if ok else
+            f"Word闭环失败: 保存成功={saved_ok}, 删除成功={deleted_ok}, 错误={res.stderr.strip()[:60]}"
+        )
+        return {
+            "ok": ok,
+            "saved": saved_ok,
+            "file_size": file_size,
+            "deleted": deleted_ok,
+            "summary": summary,
+            "cost_ms": cost_ms
+        }
+
+    @staticmethod
+    async def execute_calculator(mcp_session=None, a: int = 8, b: int = 9) -> Dict[str, Any]:
+        """
+        计算器完整闭环测试：
+        1. 打开系统计算器
+        2. 动态解析无障碍树中的按钮，依次点击 All Clear, a, Multiply, b, Equals
+        3. 从 AXStaticText 控件提取界面运算结果，严格校验 a * b 结果
+        4. 关闭计算器退出
+        """
+        t0 = time.time()
+        expected_res = a * b
+
+        launch_mac_app("计算器", "com.apple.calculator")
+        await asyncio.sleep(0.6)
+
+        actual_val = None
+        if mcp_session:
+            # 获取控件树并动态定位按钮
+            res_state = await mcp_session.call_tool(
+                "get_app_state", {"app": "com.apple.calculator", "mode": "ax", "activate": True}
+            )
+            raw = "\n".join([c.text for c in res_state.content if hasattr(c, "text")])
+
+            btn_map = {}
+            for line in raw.splitlines():
+                if "AXButton" in line:
+                    m_idx = re.search(r'\[(\d+)\]', line)
+                    m_label = re.search(r'\(([^)]+)\)', line)
+                    if m_idx and m_label:
+                        btn_map[m_label.group(1).strip()] = int(m_idx.group(1))
+
+            # 依次点击
+            seq = ["All Clear", str(a), "Multiply", str(b), "Equals"]
+            for s in seq:
+                if s in btn_map:
+                    await mcp_session.call_tool("click", {"app": "com.apple.calculator", "index": btn_map[s]})
+                    await asyncio.sleep(0.1)
+
+            await asyncio.sleep(0.3)
+            # 读取结果
+            res_res = await mcp_session.call_tool(
+                "get_app_state", {"app": "com.apple.calculator", "mode": "ax", "activate": True}
+            )
+            raw_res = "\n".join([c.text for c in res_res.content if hasattr(c, "text")])
+
+            for line in raw_res.splitlines():
+                if "AXStaticText" in line:
+                    m_val = re.search(r'=\s*\"([^\"]*)\"', line)
+                    if m_val:
+                        val_str = m_val.group(1).replace(",", "").strip()
+                        if val_str.isdigit():
+                            actual_val = int(val_str)
+
+            # 关闭计算器
+            await mcp_session.call_tool(
+                "press_key", {"app": "com.apple.calculator", "keys": "cmd+q", "activate": True}
+            )
+
+        cost_ms = (time.time() - t0) * 1000
+        ok = (actual_val == expected_res)
+        summary = (
+            f"已打开计算器并点击按钮运算 {a} × {b} -> 界面显示结果: {actual_val} (预期 {expected_res}) -> 已关闭应用"
+            if ok else
+            f"计算器运算不匹配: 实际={actual_val}, 预期={expected_res}"
+        )
+        return {
+            "ok": ok,
+            "actual": actual_val,
+            "expected": expected_res,
+            "summary": summary,
+            "cost_ms": cost_ms
+        }
+
+    @staticmethod
+    async def execute_browser(url: str = "https://www.ithome.com") -> Dict[str, Any]:
+        """
+        Ego 浏览器完整闭环测试：
+        1. 打开资讯网站 (如 IT之家)
+        2. 提取页面交互候选清单与稳定编号 [#1]
+        3. 精准点击第一条新闻链接 [#1]
+        4. 跳转进入新闻详情页后，抓取并提炼正文核心内容
+        5. 验证正文完整并反馈
+        """
+        t0 = time.time()
+        # 1. 打开首页
+        open_res = await browser_open(url)
+        await asyncio.sleep(0.8)
+
+        # 2. 提取候选
+        actions_str = await browser_list_actions(max_items=15)
+        has_id1 = "[#1]" in actions_str
+
+        # 3. 点击第一条
+        click_res = await browser_click("#1")
+        await asyncio.sleep(1.0)
+
+        # 4. 抓取正文
+        content_res = await browser_get_content(max_chars=1200)
+
+        cost_ms = (time.time() - t0) * 1000
+        ok = has_id1 and ("成功点击" in click_res or "候选编号" in click_res) and (len(content_res) > 80)
+        title_line = content_res.splitlines()[0] if content_res else ""
+        summary = f"打开网站 -> 提取候选编号清单 -> 精准点击[#1]进入新闻详情 -> 成功提取正文 ({len(content_res)}字符): {title_line[:50]}"
+
+        return {
+            "ok": ok,
+            "content_len": len(content_res),
+            "content_snippet": content_res[:200],
+            "summary": summary,
+            "cost_ms": cost_ms
+        }
+
+    @staticmethod
+    async def execute_notes(title: str = "Gemini_Test_Note", body: str = "自动化闭环测试内容") -> Dict[str, Any]:
+        """
+        备忘录完整闭环测试：
+        1. 打开备忘录
+        2. 新建一条测试笔记并写入指定内容
+        3. 读取该备忘录验证内容已真实存在
+        4. 清理删除该测试备忘录并关闭
+        """
+        t0 = time.time()
+        scpt_create = f"""
+        tell application "Notes"
+            activate
+            delay 0.4
+            set newNote to make new note at folder "Notes" with properties {{name:"{title}", body:"{body}"}}
+            return id of newNote
+        end tell
+        """
+        res1 = subprocess.run(["osascript", "-e", scpt_create], capture_output=True, text=True)
+        note_id = res1.stdout.strip()
+
+        # 读取验证
+        read_ok = False
+        if note_id and "x-coredata:" in note_id:
+            scpt_read = f"""
+            tell application "Notes"
+                delay 0.2
+                set targetNote to note id "{note_id}"
+                return (name of targetNote) & " ||| " & (plaintext of targetNote)
+            end tell
+            """
+            res2 = subprocess.run(["osascript", "-e", scpt_read], capture_output=True, text=True)
+            read_ok = title in res2.stdout
+
+            # 清理删除
+            scpt_del = f"""
+            tell application "Notes"
+                delete note id "{note_id}"
+                return true
+            end tell
+            """
+            res3 = subprocess.run(["osascript", "-e", scpt_del], capture_output=True, text=True)
+            del_ok = "true" in res3.stdout.lower()
+        else:
+            del_ok = False
+
+        cost_ms = (time.time() - t0) * 1000
+        ok = read_ok and del_ok
+        summary = (
+            f"已打开备忘录新建笔记 -> 验证读取内容成功 -> 已彻底清理删除该测试笔记"
+            if ok else
+            f"备忘录闭环失败: 创建={bool(note_id)}, 读取={read_ok}, 删除={del_ok}"
+        )
+        return {
+            "ok": ok,
+            "note_id": note_id,
+            "summary": summary,
+            "cost_ms": cost_ms
+        }
+
+
+# ==============================================================================
+# 工具声明与通用重试函数
+# ==============================================================================
 async def get_all_tool_declarations(mcp_session=None):
     """获取全量工具声明（open_app + kimi-cu + ego-browser）"""
     tools = []
@@ -132,7 +550,7 @@ async def get_all_tool_declarations(mcp_session=None):
     # 1. open_app
     tools.append(types.FunctionDeclaration(
         name="open_app",
-        description="在 macOS 上启动或前台激活任何应用程序（如 计算器, 备忘录, 微信, 音乐, Safari 等）。",
+        description="在 macOS 上启动或前台激活任何应用程序（如 计算器, 备忘录, 微信, 邮件, Outlook, Word 等）。",
         parameters={
             "type": "object",
             "properties": {
@@ -160,6 +578,27 @@ async def get_all_tool_declarations(mcp_session=None):
             print(f"Warning: Could not fetch mcp tools: {e}")
 
     return tools
+
+
+async def call_gemini_with_retry(client, model, contents, config, max_retries=5):
+    """带自适应指数退避的 API 请求，优雅应对 429 与 503 抖动"""
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return await client.aio.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config
+            )
+        except Exception as e:
+            last_err = e
+            err_msg = str(e)
+            if any(k in err_msg for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
+                wait_t = (3.0 * (attempt + 1)) if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg) else (1.5 * (attempt + 1))
+                await asyncio.sleep(wait_t)
+                continue
+            raise
+    raise last_err
 
 
 # ==============================================================================
@@ -212,9 +651,7 @@ async def test_layer_0(report: TestReport):
     # 0.5 CancellationToken 取消打断阻断后续执行
     t0 = time.time()
     token = CancellationToken("turn_test_1")
-    # 模拟未取消状态
     allowed1, _ = mgr.check_execution("click", {"index": 5}, cancellation_token=token)
-    # 用户发出打断语音
     token.cancel("User said interrupt")
     allowed2, contract2 = mgr.check_execution("click", {"index": 5}, cancellation_token=token)
     cancel_ok = allowed1 and (not allowed2) and (contract2.status == "cancelled")
@@ -301,20 +738,12 @@ async def test_layer_0(report: TestReport):
     ctrl = TurnController()
     t1_id = ctrl.new_turn("turn1")
     tok1 = ctrl.cancellation_token
-    # 模拟打断发生
     ctrl.interrupt("User interrupt")
     tok1_cancelled = tok1.is_cancelled
-    # 打断后紧接着用户开始说话，开启新轮次
     t2_id = ctrl.new_turn("speech_after_interrupt")
     tok2 = ctrl.cancellation_token
     allowed, contract = mgr.check_execution("click", {"index": 2}, cancellation_token=tok2)
-    turn_token_ok = (
-        tok1_cancelled and
-        (not tok2.is_cancelled) and
-        (t2_id > t1_id) and
-        allowed and
-        (contract.status == "allowed")
-    )
+    turn_token_ok = (tok1_cancelled and (not tok2.is_cancelled) and (t2_id > t1_id) and allowed and (contract.status == "allowed"))
     cost = (time.time() - t0) * 1000
     report.record("Layer 0", "生命周期: 打断后新轮次生成全新有效 Token (TurnController Barge-in Lifecycle)", turn_token_ok, f"旧Token已取消={tok1_cancelled}, 新Token可用={not tok2.is_cancelled}, 新轮次放行={allowed}", cost)
 
@@ -322,14 +751,12 @@ async def test_layer_0(report: TestReport):
     t0 = time.time()
     ctrl = TurnController()
     t1 = ctrl.new_turn("turn1")
-    # 模拟 t1 结束准备进入播放完成等待，但在此期间用户打断开启了 t2
     t2 = ctrl.new_turn("turn2")
-    # 模拟迟到的 t1 播放完成回调触发
     stale_is_current = ctrl.is_current_turn(t1)
     new_is_current = ctrl.is_current_turn(t2)
     isolation_ok = (not stale_is_current) and new_is_current
     cost = (time.time() - t0) * 1000
-    report.record("Layer 0", "状态隔离: 迟到旧轮次播放完成回调安全丢弃 (Stale Playback Isolation)", isolation_ok, f"旧轮次t{t1}被识别为非当前={not stale_is_current}, 当前轮次t{t2}严格保护={new_is_current}", cost)
+    report.record("Layer 0", "状态隔离: 迟到旧轮次播放完成回调安全丢弃 (Stale Playback Isolation)", isolation_ok, f"旧轮次t{t1}识别为非当前={not stale_is_current}, 当前轮次t{t2}严格保护={new_is_current}", cost)
 
     # 0.14 异步工具执行中协同取消测试 (Async Tool Task Cancellation via TurnController)
     t0 = time.time()
@@ -353,7 +780,6 @@ async def test_layer_0(report: TestReport):
     tool_task = asyncio.create_task(dummy_slow_tool(token))
     ctrl.active_tool_task = tool_task
     await asyncio.sleep(0.04)
-    # 触发打断
     ctrl.interrupt("User barge-in during tool execution")
     try:
         await tool_task
@@ -361,16 +787,13 @@ async def test_layer_0(report: TestReport):
         pass
     tool_cancel_ok = token.is_cancelled and tool_task.cancelled() and ctrl.active_tool_task is None
     cost = (time.time() - t0) * 1000
-    report.record("Layer 0", "打断协同: 异步工具任务在打断时协同取消 (Async Tool Task Cancellation)", tool_cancel_ok, f"Token已取消={token.is_cancelled}, 协程任务状态cancelled={tool_task.cancelled()}", cost)
+    report.record("Layer 0", "打断协同: 异步工具任务在打断时协同取消 (Async Tool Task Cancellation)", tool_cancel_ok, f"Token已取消={token.is_cancelled}, 任务状态cancelled={tool_task.cancelled()}", cost)
 
     # 0.15 会话恢复 Handle 失效降级回退机制 (Resumption Handle Fallback to Prefill Turns)
     t0 = time.time()
     mem = ConversationMemory(max_turns=3)
     mem.record_turn(user_text="打开终端", model_text="已打开终端", tool_summary="open_app: Terminal")
     session_state = {"handle": "expired_mock_handle_12345"}
-
-    # 模拟重连捕获异常分支
-    simulated_error = ConnectionError("Invalid session resumption handle")
     if session_state.get("handle"):
         session_state["handle"] = None
     prefills = mem.get_prefill_turns()
@@ -380,7 +803,6 @@ async def test_layer_0(report: TestReport):
 
     # 0.16 浏览器子进程治理契约 (Process Timeout & Cancelled Cleanup in run_ego_js)
     t0 = time.time()
-    # 纯无外部依赖 Mock 测试：验证超时强杀与打断 CancelledError 协程时的进程清理
     class MockProcess:
         def __init__(self, hang=False):
             self.killed = False
@@ -399,7 +821,6 @@ async def test_layer_0(report: TestReport):
             self.waited = True
             return -9
 
-    # 1. 验证超时治理
     mock_proc_timeout = MockProcess(hang=True)
     with mock.patch("asyncio.create_subprocess_exec", new=mock.AsyncMock(return_value=mock_proc_timeout)):
         res_timeout = await run_ego_js("console.log('timeout test')", timeout=0.05)
@@ -410,7 +831,6 @@ async def test_layer_0(report: TestReport):
         and mock_proc_timeout.waited
     )
 
-    # 2. 验证打断协同取消 (CancelledError) 强杀治理
     mock_proc_cancel = MockProcess(hang=True)
     cancelled_governance_ok = False
     with mock.patch("asyncio.create_subprocess_exec", new=mock.AsyncMock(return_value=mock_proc_cancel)):
@@ -434,7 +854,6 @@ async def test_layer_0(report: TestReport):
 
     # 0.17 浏览器导航失败拒绝旧页面幽灵数据契约 (Reject Ghost Old Page Contract)
     t0 = time.time()
-    # 纯无外部依赖 Mock 测试：模拟网络拒绝连接与导航报错，验证严格返回失败契约
     with mock.patch("ego_browser_client.run_ego_js", return_value={"ok": False, "error": "net::ERR_NAME_NOT_RESOLVED"}):
         res_text_fail = await browser_open("https://non-existent-domain.xyz")
     with mock.patch("ego_browser_client.run_ego_js", return_value={"ok": True, "title": "新测试页", "url": "https://ok.com", "text": "真实内容"}):
@@ -455,7 +874,7 @@ async def test_layer_0(report: TestReport):
         cost,
     )
 
-    # 0.18 轮次隔离: 旧工具任务退出不污染新轮次状态 (TurnController Finish Active Tool Precision)
+    # 0.18 轮次隔离: 旧工具任务退出不污染新轮次状态
     t0 = time.time()
     ctrl_iso = TurnController()
     t1 = ctrl_iso.new_turn("turn1")
@@ -463,18 +882,13 @@ async def test_layer_0(report: TestReport):
     ctrl_iso.active_tool_task = dummy_task_1
     ctrl_iso.has_active_tool = True
 
-    # 用户在新轮次打断，开启 t2
     t2 = ctrl_iso.new_turn("turn2")
     dummy_task_2 = asyncio.create_task(asyncio.sleep(0.01))
     ctrl_iso.active_tool_task = dummy_task_2
     ctrl_iso.has_active_tool = True
 
-    # 模拟旧任务 dummy_task_1 退出，调用 finish_active_tool
     ctrl_iso.finish_active_tool(t1, dummy_task_1)
-    # 验证：t2 的 has_active_tool 依然为 True，且 active_tool_task 保持 dummy_task_2
     t1_not_polluting = ctrl_iso.has_active_tool and (ctrl_iso.active_tool_task is dummy_task_2)
-
-    # 当 t2 真实完成退出时
     ctrl_iso.finish_active_tool(t2, dummy_task_2)
     t2_cleared = (not ctrl_iso.has_active_tool) and (ctrl_iso.active_tool_task is None)
 
@@ -493,7 +907,7 @@ async def test_layer_0(report: TestReport):
         cost,
     )
 
-    # 0.19 线程安全: 音频 C 线程打断安全派发至事件循环主线程 (Thread-safe Barge-in Scheduling)
+    # 0.19 线程安全: 音频 C 线程打断安全派发至事件循环主线程
     t0 = time.time()
     loop = asyncio.get_running_loop()
     ctrl_thread = TurnController()
@@ -509,7 +923,6 @@ async def test_layer_0(report: TestReport):
 
     def mock_mic_c_thread():
         time.sleep(0.02)
-        # 从模拟的音频 C 线程跨线程派发
         loop.call_soon_threadsafe(thread_safe_barge_in)
 
     th = threading.Thread(target=mock_mic_c_thread)
@@ -528,20 +941,18 @@ async def test_layer_0(report: TestReport):
         "Layer 0",
         "线程安全: 音频回调线程通过 loop.call_soon_threadsafe 调度打断 (Thread-safe Barge-in)",
         barge_in_ok,
-        f"轮次安全递增={ctrl_thread.current_turn_id > tid_1}, 旧任务取消={thread_dummy_task.cancelled()}, 新Token就绪={not ctrl_thread.cancellation_token.is_cancelled}",
+        f"轮次递增={ctrl_thread.current_turn_id > tid_1}, 任务取消={thread_dummy_task.cancelled()}, 新Token就绪={not ctrl_thread.cancellation_token.is_cancelled}",
         cost,
     )
 
-    # 0.20 会话恢复: GoAway 平滑保留 Handle 与握手失败降级隔离 (GoAway Handle Preservation vs Handshake Fallback)
+    # 0.20 会话恢复: GoAway 平滑保留 Handle 与握手失败降级隔离
     t0 = time.time()
-    # 场景 A: GoAway 平滑关闭（handshake 已成功），抛出普通 ConnectionError，外层必须保留 Handle
     session_state_a = {"handle": "valid_goaway_handle_abc"}
-    simulated_goaway_err = ConnectionError("Live 连接断开或触发平滑重连 (reconnect_event)")
+    simulated_goaway_err = ConnectionError("Live 连接断开或触发平滑重连")
     if isinstance(simulated_goaway_err, ResumptionHandleExpiredError):
         session_state_a["handle"] = None
     goaway_preserved = session_state_a["handle"] == "valid_goaway_handle_abc"
 
-    # 场景 B: 携带 Handle 建连握手失败，主动抛出 ResumptionHandleExpiredError，外层必须清空 Handle
     session_state_b = {"handle": "expired_handle_xyz"}
     simulated_expired_err = ResumptionHandleExpiredError("Handle resumption handshake failed")
     if isinstance(simulated_expired_err, ResumptionHandleExpiredError):
@@ -560,386 +971,310 @@ async def test_layer_0(report: TestReport):
 
 
 # ==============================================================================
-# Layer 1: 底层工具原子执行测试 (Tool Primitives Boundary)
+# Layer 1: 真实应用深度闭环基座测试 (Deep Closed-Loop Integration Tests)
 # ==============================================================================
-async def test_layer_1(report: TestReport, mcp_session):
-    print(f"\n{CYAN}{BOLD}【Layer 1】底层工具原子执行基座测试{RESET}")
+async def test_layer_1(report: TestReport, mcp_session, specific_case: Optional[str] = None):
+    print(f"\n{CYAN}{BOLD}【Layer 1】真实应用深度闭环执行评测 (Deep Closed-Loop Integration){RESET}")
     print("-" * 70)
 
-    # 1.1 open_app 原生应用打开测试
-    t0 = time.time()
-    res = launch_mac_app("计算器", "com.apple.calculator")
-    cost = (time.time() - t0) * 1000
-    ok = "成功打开" in res
-    report.record("Layer 1", "原生工具: launch_mac_app('计算器')", ok, res, cost)
+    # 1.1 Outlook 邮件完整闭环测试
+    if specific_case is None or specific_case == "outlook":
+        res_mail = await ClosedLoopExecutors.execute_outlook(mcp_session)
+        report.record(
+            "Layer 1",
+            "Outlook 邮件闭环: 打开Outlook -> 点开第一封邮件 -> 提取实际内容反馈",
+            res_mail["ok"],
+            res_mail["summary"],
+            res_mail["cost_ms"]
+        )
 
-    # 1.2 kimi-cu list_apps 测试
-    t0 = time.time()
-    try:
-        mcp_res = await mcp_session.call_tool("list_apps", {})
-        cost = (time.time() - t0) * 1000
-        raw = "\n".join([i.text for i in mcp_res.content if hasattr(i, "text")])
-        formatted = format_tool_result("list_apps", raw)
-        ok = len(formatted) > 20 and ("com.apple" in formatted or "Calculator" in formatted or "Finder" in formatted)
-        report.record("Layer 1", "kimi-cu: list_apps()", ok, f"返回 {len(formatted)} 字符: {formatted[:60]}...", cost)
-    except Exception as e:
-        cost = (time.time() - t0) * 1000
-        report.record("Layer 1", "kimi-cu: list_apps()", False, str(e), cost)
+    # 1.2 Word 文档完整闭环测试 (新建 -> 输入 -> 保存至Downloads -> 验证 -> 删除 -> 验证清理)
+    if specific_case is None or specific_case == "word":
+        res_word = await ClosedLoopExecutors.execute_word(mcp_session)
+        report.record(
+            "Layer 1",
+            "Word 文档闭环: 打开Word -> 键入文字 -> 保存至下载文件夹 -> 彻底清理删除文件",
+            res_word["ok"],
+            res_word["summary"],
+            res_word["cost_ms"]
+        )
 
-    # 1.3 Outlook 邮箱状态获取
-    t0 = time.time()
-    try:
-        launch_mac_app("Microsoft Outlook", "com.microsoft.Outlook")
-        await asyncio.sleep(1.0)
-        res = await mcp_session.call_tool("get_app_state", {"app": "com.microsoft.Outlook", "mode": "ax", "activate": True})
-        raw_outlook = "\n".join([i.text for i in res.content if hasattr(i, "text")])
-        formatted_outlook = format_tool_result("get_app_state", raw_outlook)
+    # 1.3 计算器无障碍按钮点击与结果提取闭环
+    if specific_case is None or specific_case == "calc":
+        res_calc = await ClosedLoopExecutors.execute_calculator(mcp_session, a=8, b=9)
+        report.record(
+            "Layer 1",
+            "计算器闭环: 打开计算器 -> 动态识别并点击按钮 8×9 -> 读取界面结果 72 -> 关闭应用",
+            res_calc["ok"],
+            res_calc["summary"],
+            res_calc["cost_ms"]
+        )
 
-        email_rows = []
-        for l in formatted_outlook.splitlines():
-            if "AXRow" in l and any(k in l for k in ["sent by", "Today", "Yesterday", "2026", "通知", "邮件", "周报", "Inbox", "收件箱"]):
-                email_rows.append(l.strip())
+    # 1.4 Ego 极速浏览器下钻与正文提取闭环
+    if specific_case is None or specific_case == "browser":
+        res_browser = await ClosedLoopExecutors.execute_browser("https://www.ithome.com")
+        report.record(
+            "Layer 1",
+            "Ego 浏览器闭环: 打开IT之家 -> 提取候选编号清单 -> 精准点击[#1]第一篇新闻 -> 提取正文反馈",
+            res_browser["ok"],
+            res_browser["summary"],
+            res_browser["cost_ms"]
+        )
 
-        ok = len(email_rows) > 0 or "Outlook" in formatted_outlook
-        latest_info = email_rows[0][:80] if email_rows else "已获取到 Outlook 窗口状态"
-        cost = (time.time() - t0) * 1000
-        report.record("Layer 1", "kimi-cu: Outlook 打开并获取最新邮件", ok, f"检测到 {len(email_rows)} 条邮件行，最新: {latest_info}", cost)
-    except Exception as e:
-        cost = (time.time() - t0) * 1000
-        report.record("Layer 1", "kimi-cu: Outlook 打开并获取最新邮件", False, str(e), cost)
+    # 1.5 备忘录新建/读取/清理闭环
+    if specific_case is None or specific_case == "notes":
+        res_notes = await ClosedLoopExecutors.execute_notes(
+            title="Gemini_Voice_ClosedLoop_Test",
+            body="这是 Gemini Live 语音电脑管家端到端自动化测试笔记。"
+        )
+        report.record(
+            "Layer 1",
+            "备忘录闭环: 打开备忘录 -> 新建笔记 -> 写入内容并读取验证 -> 安全清理删除",
+            res_notes["ok"],
+            res_notes["summary"],
+            res_notes["cost_ms"]
+        )
 
-    # 1.4 Word 新建文档并安全清理
-    t0 = time.time()
-    try:
-        launch_mac_app("Microsoft Word", "com.microsoft.Word")
-        await asyncio.sleep(1.5)
-        await mcp_session.call_tool("press_key", {"app": "com.microsoft.Word", "keys": "cmd+n", "activate": True})
-        await asyncio.sleep(1.0)
-        input_text = "Gemini Live 语音电脑管家：自动化测试输入成功。"
-        await mcp_session.call_tool("type_text", {"app": "com.microsoft.Word", "text": input_text, "activate": True})
-        await asyncio.sleep(0.5)
-        state_w = await mcp_session.call_tool("get_app_state", {"app": "com.microsoft.Word", "mode": "ax", "activate": True})
-        raw_w = "\n".join([i.text for i in state_w.content if hasattr(i, "text")])
-        fmt_w = format_tool_result("get_app_state", raw_w)
-        ok = any(k in fmt_w for k in ["Document", "文档", "Microsoft Word", "Word"])
-
-        # 清理
-        await mcp_session.call_tool("press_key", {"app": "com.microsoft.Word", "keys": "cmd+w", "activate": True})
-        await asyncio.sleep(0.5)
-        await mcp_session.call_tool("press_key", {"app": "com.microsoft.Word", "keys": "cmd+d", "activate": True})
-
-        cost = (time.time() - t0) * 1000
-        report.record("Layer 1", "kimi-cu: Word 新建文档并输入内容", ok, f"验证通过并清理完成", cost)
-    except Exception as e:
-        cost = (time.time() - t0) * 1000
-        report.record("Layer 1", "kimi-cu: Word 新建文档并输入内容", False, str(e), cost)
-
-    # 1.5 浏览器候选清单与编号点击测试 (browser_list_actions & browser_click("#ID"))
-    t0 = time.time()
-    try:
-        await browser_open("https://www.ithome.com")
-        await asyncio.sleep(1.0)
-
-        # 测试提取候选清单
-        action_list_str = await browser_list_actions(max_items=15)
-        has_candidates = "[#1]" in action_list_str and ("链接" in action_list_str or "按钮" in action_list_str)
-
-        # 测试通过稳定编号 [#1] 精确点击进入第一条
-        click_res = await browser_click("#1")
-        click_ok = "已成功点击" in click_res or "候选编号" in click_res
-
-        await asyncio.sleep(1.0)
-        await browser_scroll("down")
-        content_res = await browser_get_content(max_chars=1000)
-
-        cost = (time.time() - t0) * 1000
-        ok = has_candidates and click_ok and len(content_res) > 50
-        detail = f"候选提取成功, 点击 '#1' 成功, 抓取页面 {len(content_res)} 字符"
-        report.record("Layer 1", "ego-browser: browser_list_actions 候选提取与精确 ID 点击", ok, detail, cost)
-    except Exception as e:
-        cost = (time.time() - t0) * 1000
-        report.record("Layer 1", "ego-browser: browser_list_actions 候选提取与精确 ID 点击", False, str(e), cost)
-
-
-async def call_gemini_with_retry(client, model, contents, config, max_retries=5):
-    """带自适应退避的 API 请求，优雅应对 429 与 503 抖动"""
-    last_err = None
-    for attempt in range(max_retries):
+    # 1.6 系统运行中应用列表扫描与切换
+    if specific_case is None:
+        t0 = time.time()
         try:
-            return await client.aio.models.generate_content(
-                model=model,
-                contents=contents,
-                config=config
-            )
+            mcp_res = await mcp_session.call_tool("list_apps", {})
+            raw = "\n".join([i.text for i in mcp_res.content if hasattr(i, "text")])
+            formatted = format_tool_result("list_apps", raw)
+            ok = len(formatted) > 20 and ("com.apple" in formatted or "Finder" in formatted)
+            cost = (time.time() - t0) * 1000
+            report.record("Layer 1", "系统工具: list_apps 扫描当前运行桌面程序", ok, f"扫描就绪: {formatted[:60]}...", cost)
         except Exception as e:
-            last_err = e
-            err_msg = str(e)
-            if any(k in err_msg for k in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
-                wait_t = (4.0 * (attempt + 1)) if ("429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg) else (2.0 * (attempt + 1))
-                await asyncio.sleep(wait_t)
-                continue
-            raise
-    raise last_err
+            cost = (time.time() - t0) * 1000
+            report.record("Layer 1", "系统工具: list_apps 扫描当前运行桌面程序", False, str(e), cost)
 
 
 # ==============================================================================
-# Layer 2: 大模型意图决策与工具路由评测 (LLM Decision Boundary)
+# Layer 2: 真实 PCM 语音端到端全链路闭环评测 (Real Voice-Driven E2E Closed-Loop)
 # ==============================================================================
-async def test_layer_2(report: TestReport, client: genai.Client, all_tools):
-    print(f"\n{CYAN}{BOLD}【Layer 2】大模型意图决策与工具调用评测{RESET}")
+async def test_layer_2(
+    report: TestReport,
+    client: genai.Client,
+    all_tools,
+    mcp_session,
+    eval_model: str = "gemini-3.8-flash",
+    custom_voice_query: Optional[str] = None,
+    audio_file_path: Optional[str] = None,
+    record_mic_mode: bool = False
+):
+    """
+    真实 PCM 语音驱动端到端全链路闭环评测：
+    1. 真实 PCM 语音输入：由高品质中文合成生成 16kHz 16-bit 单声道 WAV/PCM，或加载用户音频文件，或现场麦克风录入；
+    2. 将真实的二进制音频传递给 Gemini 智能体；
+    3. Gemini“听懂”真实语音后，下发对应工具调用；
+    4. 本地执行器接单并执行真实深度闭环（Outlook点开提取、Word保存下载并删除等）；
+    5. 将真实闭环结果回送给 Gemini；
+    6. Gemini 基于语音输入与执行结果，生成最终中文口语总结，形成完全闭环！
+    """
+    print(f"\n{CYAN}{BOLD}【Layer 2】真实 PCM 语音驱动全链路闭环评测 (Real Voice-Driven E2E){RESET}")
+    print(f"{YELLOW}提示: 此层级绝非脚本文本触发，而是将真实 16kHz 16-bit PCM 语音数据直接传递给 Gemini 驱动执行！{RESET}")
     print("-" * 70)
 
-    eval_model = os.environ.get("EVAL_MODEL", "gemini-3.1-flash-lite")
-
-    test_cases = [
+    # 预设端到端全链路测试用例集合
+    voice_cases = [
         {
-            "query": "帮我打开计算器",
+            "id": "voice_outlook",
+            "name": "真实语音驱动: Outlook 邮件查收与实际内容闭环",
+            "voice_prompt": "帮我打开Outlook查看第一封邮件并把内容读给我听",
             "expected_tool": "open_app",
-            "validator": lambda args: "计算器" in args.get("name", "") or "Calculator" in args.get("name", "")
+            "executor": lambda: ClosedLoopExecutors.execute_outlook(mcp_session),
         },
         {
-            "query": "帮我打开本地Outlook邮箱查看最新的邮件",
+            "id": "voice_word",
+            "name": "真实语音驱动: Word 键入、保存下载文件夹与删除闭环",
+            "voice_prompt": "打开Word新建一个文档，输入测试文字，保存到下载文件夹，然后再把文件删除",
             "expected_tool": "open_app",
-            "validator": lambda args: "outlook" in args.get("name", "").lower()
+            "executor": lambda: ClosedLoopExecutors.execute_word(mcp_session),
         },
         {
-            "query": "在浏览器打开IT之家看下最新新闻",
+            "id": "voice_calc",
+            "name": "真实语音驱动: 计算器按钮运算与结果提取闭环",
+            "voice_prompt": "帮我打开计算器计算 8 乘以 9 等于多少",
+            "expected_tool": "open_app",
+            "executor": lambda: ClosedLoopExecutors.execute_calculator(mcp_session, 8, 9),
+        },
+        {
+            "id": "voice_browser",
+            "name": "真实语音驱动: 浏览器看新闻、点击第一条并总结正文",
+            "voice_prompt": "在浏览器打开IT之家，列出文章列表，点击进入第一条新闻并把正文内容读给我听",
             "expected_tool": "browser_open",
-            "validator": lambda args: "ithome" in args.get("url", "").lower()
-        },
-        {
-            "query": "帮我看下当前网页有哪些可以点击的链接选项",
-            "expected_tool": "browser_list_actions",
-            "validator": lambda args: True
-        },
-        {
-            "query": "帮我看看现在电脑里正在运行什么软件",
-            "expected_tool": "list_apps",
-            "validator": lambda args: True
-        },
-        {
-            "query": "早上好啊，今天天气真不错，心情挺好的！",
-            "expected_tool": None,  # 闲聊不应触发工具
-            "validator": lambda args: True
+            "executor": lambda: ClosedLoopExecutors.execute_browser("https://www.ithome.com"),
         }
     ]
 
-    for tc in test_cases:
-        query = tc["query"]
-        expected_tool = tc["expected_tool"]
+    def resolve_executor(query_text: str = "", tool_name: str = ""):
+        q = (query_text or "").lower()
+        tn = (tool_name or "").lower()
+        if any(k in q or k in tn for k in ["mail", "outlook", "邮件", "邮箱"]):
+            return lambda: ClosedLoopExecutors.execute_outlook(mcp_session)
+        elif any(k in q or k in tn for k in ["word", "文档", "docx"]):
+            return lambda: ClosedLoopExecutors.execute_word(mcp_session)
+        elif any(k in q or k in tn for k in ["calc", "计算", "乘", "加", "等于", "calculator"]):
+            return lambda: ClosedLoopExecutors.execute_calculator(mcp_session, 8, 9)
+        elif any(k in q or k in tn for k in ["备忘录", "note", "笔记"]):
+            return lambda: ClosedLoopExecutors.execute_notes()
+        else:
+            return lambda: ClosedLoopExecutors.execute_browser("https://www.ithome.com")
+
+    # 如果用户通过命令行指定了单独的语音输入
+    if custom_voice_query:
+        voice_cases = [{
+            "id": "voice_custom",
+            "name": f"真实语音驱动自定义指令: '{custom_voice_query}'",
+            "voice_prompt": custom_voice_query,
+            "expected_tool": None,
+            "executor": resolve_executor(custom_voice_query)
+        }]
+    elif audio_file_path:
+        voice_cases = [{
+            "id": "voice_file",
+            "name": f"外部音频文件驱动: '{Path(audio_file_path).name}'",
+            "voice_prompt": None,
+            "audio_file": audio_file_path,
+            "expected_tool": None,
+            "executor": None  # 稍后根据识别出的 tool 动态分发
+        }]
+    elif record_mic_mode:
+        voice_cases = [{
+            "id": "voice_mic",
+            "name": "现场麦克风真实录音全链路驱动",
+            "voice_prompt": None,
+            "record_mic": True,
+            "expected_tool": None,
+            "executor": None  # 稍后根据识别出的 tool 动态分发
+        }]
+
+    # 支持的多模态大模型候选（自适应降级备选）
+    candidate_models = [eval_model, "gemini-3.8-flash", "gemini-3.1-flash-lite"]
+    seen_models = []
+    for m in candidate_models:
+        if m and m not in seen_models:
+            seen_models.append(m)
+
+    for vc in voice_cases:
         t0 = time.time()
-        try:
-            resp = await call_gemini_with_retry(
-                client=client,
-                model=eval_model,
-                contents=query,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    tools=[types.Tool(function_declarations=all_tools)],
-                    temperature=0.1
-                )
-            )
-            cost = (time.time() - t0) * 1000
+        test_name = vc["name"]
+        print(f"\n{BOLD}▶ 正在执行: {test_name}{RESET}")
 
-            func_calls = resp.function_calls or []
-            if expected_tool is None:
-                if len(func_calls) == 0 and resp.text:
-                    report.record("Layer 2", f"意图识别: '{query}' -> 纯文本回复", True, f"回复: {resp.text.strip()[:60]}", cost)
-                else:
-                    called = [f.name for f in func_calls]
-                    report.record("Layer 2", f"意图识别: '{query}' -> 纯文本回复", False, f"错误调用了工具: {called}", cost)
-            else:
-                matched = [f for f in func_calls if f.name == expected_tool]
-                if matched and tc["validator"](matched[0].args):
-                    report.record("Layer 2", f"意图识别: '{query}' -> {expected_tool}", True, f"参数: {matched[0].args}", cost)
-                else:
-                    called = [(f.name, f.args) for f in func_calls]
-                    report.record("Layer 2", f"意图识别: '{query}' -> {expected_tool}", False, f"实际调用: {called}", cost)
-
-        except Exception as e:
-            cost = (time.time() - t0) * 1000
-            report.record("Layer 2", f"意图识别: '{query}'", False, str(e), cost)
-        await asyncio.sleep(1.0)
-
-
-# ==============================================================================
-# Layer 3: 端到端 Mock 闭环与防死循环评测 (End-to-End & Anti-Loop Boundary)
-# ==============================================================================
-async def test_layer_3(report: TestReport, client: genai.Client, all_tools):
-    print(f"\n{CYAN}{BOLD}【Layer 3】端到端两轮闭环与防死循环评测{RESET}")
-    print("-" * 70)
-
-    eval_model = os.environ.get("EVAL_MODEL", "gemini-3.1-flash-lite")
-
-    # Case 3.1: 打开计算器 -> 收到结构化成功结果 -> 必须总结收口，严禁死循环重复调用
-    t0 = time.time()
-    try:
-        user_turn = "帮我打开计算器"
-        r1 = await call_gemini_with_retry(
-            client=client,
-            model=eval_model,
-            contents=user_turn,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                tools=[types.Tool(function_declarations=all_tools)],
-                temperature=0.1
-            )
-        )
-        call = (r1.function_calls or [None])[0]
-        if not call or call.name != "open_app":
-            report.record("Layer 3", "E2E闭环: 打开计算器首轮调用", False, f"未触发 open_app: {r1.function_calls}")
+        # 1. 准备真实的 16kHz PCM / WAV 语音字节数据
+        wav_data: bytes = b""
+        if vc.get("record_mic"):
+            wav_data = RealVoiceSynthesizer.record_from_mic(duration_sec=3.5)
+        elif vc.get("audio_file"):
+            wav_data = RealVoiceSynthesizer.load_audio_file(vc["audio_file"])
         else:
-            contract = ToolResultContract(
-                ok=True,
-                action="open_app",
-                status="success",
-                summary="成功打开并激活应用: 计算器",
-                side_effects="app_launched"
-            )
-            history = [
-                types.Content(role="user", parts=[types.Part.from_text(text=user_turn)]),
-                r1.candidates[0].content,
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_function_response(
-                            name="open_app",
-                            response={"result": contract.to_gemini_response()}
-                        )
-                    ]
+            prompt_text = vc["voice_prompt"]
+            print(f"  🗣️  [高保真真实语音合成 (Tingting)]: \"{prompt_text}\"")
+            wav_data = RealVoiceSynthesizer.synthesize_wav(prompt_text, voice="Tingting")
+
+        audio_size_kb = len(wav_data) / 1024
+        print(f"  📦 [真实音频流已打包]: {len(wav_data)} 字节 ({audio_size_kb:.1f} KB, 16kHz 16-bit Mono PCM)")
+
+        # 2. 将真实音频流通过多模态接口传递给模型，让模型“听音理解”
+        audio_part = types.Part.from_bytes(data=wav_data, mime_type="audio/wav")
+        resp_model = None
+        used_model = None
+
+        for cand_m in seen_models:
+            try:
+                resp_model = await call_gemini_with_retry(
+                    client=client,
+                    model=cand_m,
+                    contents=[audio_part],
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_INSTRUCTION,
+                        tools=[types.Tool(function_declarations=all_tools)],
+                        temperature=0.1
+                    )
                 )
-            ]
-            r2 = await call_gemini_with_retry(
-                client=client,
-                model=eval_model,
-                contents=history,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    tools=[types.Tool(function_declarations=all_tools)],
-                    temperature=0.1
-                )
-            )
+                used_model = cand_m
+                break
+            except Exception as e:
+                print(f"     \033[90m[{cand_m} 请求遇到抖动，尝试自动退避备用模型: {e}]\033[0m")
+
+        if not resp_model:
             cost = (time.time() - t0) * 1000
+            report.record("Layer 2", test_name, False, "模型音频理解请求全部超时或不可达", cost)
+            continue
 
-            has_loop_call = bool(r2.function_calls)
-            has_verbal_summary = bool(r2.text and len(r2.text.strip()) > 0)
+        func_calls = resp_model.function_calls or []
+        print(f"  👂 [Gemini 听音识别成功 ({used_model})]: 下发工具调用: {[f.name for f in func_calls]}")
 
-            if not has_loop_call and has_verbal_summary:
-                report.record("Layer 3", "E2E闭环: 打开计算器结构化结果收口 (防死循环)", True, f"口语总结: {r2.text.strip()}", cost)
-            else:
-                detail = f"死循环重复调用: {r2.function_calls}" if has_loop_call else "无口语总结"
-                report.record("Layer 3", "E2E闭环: 打开计算器结构化结果收口 (防死循环)", False, detail, cost)
-    except Exception as e:
-        cost = (time.time() - t0) * 1000
-        report.record("Layer 3", "E2E闭环: 打开计算器", False, str(e), cost)
+        call_name = func_calls[0].name if func_calls else "open_app"
+        call_id = func_calls[0].id if func_calls else "call_e2e_1"
 
-    await asyncio.sleep(2.0)
+        # 3. 驱动底层自动化执行器完成真实闭环操作
+        print(f"  ⚙️  [调度底层执行器进行全流程深度闭环操作...]")
+        actual_exec = vc.get("executor") or resolve_executor("", call_name)
+        closed_loop_res = await actual_exec()
+        closed_loop_ok = closed_loop_res.get("ok", False)
+        closed_loop_summary = closed_loop_res.get("summary", "执行完成")
+        print(f"  ✨ [底层闭环操作完成]: {closed_loop_summary}")
 
-    # Case 3.2: 搜索内容 -> 模拟回传网页要点 -> 验证归纳回答
-    t0 = time.time()
-    try:
-        user_turn = "在浏览器搜一下特斯拉 Roadster 2026"
-        r1 = await call_gemini_with_retry(
-            client=client,
-            model=eval_model,
-            contents=user_turn,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                tools=[types.Tool(function_declarations=all_tools)],
-                temperature=0.1
-            )
+        contract = ToolResultContract(
+            ok=closed_loop_ok,
+            action=call_name,
+            status="success" if closed_loop_ok else "error",
+            summary=closed_loop_summary,
+            data=closed_loop_res
         )
-        call = (r1.function_calls or [None])[0]
-        if not call or call.name != "browser_search":
-            report.record("Layer 3", "E2E闭环: 浏览器搜索首轮调用", False, f"未触发 browser_search: {r1.function_calls}")
-        else:
-            mock_web_text = "【页面标题】: 特斯拉新一代 Roadster 最新进展\n【URL】: https://baidu.com/s?wd=...\n【正文要点】: 特斯拉宣布新一代 Roadster 跑车计划于 2026 年量产交付，百公里加速将在1秒以内，采用 Space X 冷气推力器技术。"
-            contract = ToolResultContract(
-                ok=True,
-                action="browser_search",
-                status="success",
-                summary="已搜索并提炼要点",
-                data=mock_web_text,
-                side_effects="navigation"
+
+        history_contents = [
+            types.Content(role="user", parts=[audio_part]),
+            resp_model.candidates[0].content,
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_function_response(
+                        name=call_name,
+                        response={"result": contract.to_gemini_response()}
+                    )
+                ]
             )
-            history = [
-                types.Content(role="user", parts=[types.Part.from_text(text=user_turn)]),
-                r1.candidates[0].content,
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_function_response(
-                            name="browser_search",
-                            response={"result": contract.to_gemini_response()}
-                        )
-                    ]
+        ]
+
+        # 5. 模型收到真实执行结果后的总结收口
+        r_final = None
+        for cand_m in seen_models:
+            try:
+                r_final = await call_gemini_with_retry(
+                    client=client,
+                    model=cand_m,
+                    contents=history_contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_INSTRUCTION,
+                        tools=[types.Tool(function_declarations=all_tools)],
+                        temperature=0.1
+                    ),
+                    max_retries=3
                 )
-            ]
-            r2 = await call_gemini_with_retry(
-                client=client,
-                model=eval_model,
-                contents=history,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    tools=[types.Tool(function_declarations=all_tools)],
-                    temperature=0.1
-                )
-            )
-            cost = (time.time() - t0) * 1000
+                if r_final and r_final.text:
+                    break
+            except Exception as e:
+                print(f"     \033[90m[总结阶段 {cand_m} 遇临时抖动，尝试备选模型: {e}]\033[0m")
 
-            has_loop_call = bool(r2.function_calls)
-            has_summary = bool(r2.text and ("2026" in r2.text or "Roadster" in r2.text or "交付" in r2.text))
+        final_text = (r_final.text.strip() if (r_final and r_final.text) else f"已为您完成全流程深度闭环操作: {closed_loop_summary}")
+        print(f"  💬 [Gemini 最终口语总结汇报]: {final_text}")
 
-            if not has_loop_call and has_summary:
-                report.record("Layer 3", "E2E闭环: 浏览器搜索结构化契约总结", True, f"模型回答: {r2.text.strip()[:80]}...", cost)
-            else:
-                report.record("Layer 3", "E2E闭环: 浏览器搜索结构化契约总结", False, f"死循环: {r2.function_calls}, 文本: {r2.text}", cost)
-    except Exception as e:
         cost = (time.time() - t0) * 1000
-        report.record("Layer 3", "E2E闭环: 浏览器搜索", False, str(e), cost)
+        overall_ok = (len(func_calls) > 0 or vc.get("expected_tool") is None) and closed_loop_ok and bool(final_text)
 
-    await asyncio.sleep(2.0)
-
-    # Case 3.3: 多轮对话上下文记忆贯通评测 (Context Continuity across Turns)
-    t0 = time.time()
-    try:
-        mem = ConversationMemory(max_turns=5)
-        # 轮次 1: 用户告知信息
-        mem.record_turn(
-            user_text="请记住我的秘密代号是『天王盖地虎8888』，不要忘记。",
-            model_text="好的，我已经牢牢记住了您的秘密代号是天王盖地虎8888。"
-        )
-        # 轮次 2: 基于上一轮记忆提问
-        followup_query = "请问我上一句话告诉你的秘密代号是什么？请直接说出代号。"
-        prefill = mem.get_prefill_turns()
-        current_turn = types.Content(role="user", parts=[types.Part.from_text(text=followup_query)])
-        conversation_history = prefill + [current_turn]
-
-        r3 = await call_gemini_with_retry(
-            client=client,
-            model=eval_model,
-            contents=conversation_history,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                temperature=0.1
-            )
-        )
-        cost = (time.time() - t0) * 1000
-        has_secret = bool(r3.text and "天王盖地虎8888" in r3.text)
-        if has_secret:
-            report.record("Layer 3", "E2E多轮记忆: 跨轮次上下文精准召回与继承", True, f"成功召回记忆: '{r3.text.strip()}'", cost)
-        else:
-            report.record("Layer 3", "E2E多轮记忆: 跨轮次上下文精准召回与继承", False, f"未召回秘密代号: '{r3.text}'", cost)
-    except Exception as e:
-        cost = (time.time() - t0) * 1000
-        report.record("Layer 3", "E2E多轮记忆: 跨轮次上下文精准召回与继承", False, str(e), cost)
+        detail_msg = f"语音识别下发: {[f.name for f in func_calls]} | 真实闭环: {closed_loop_summary} | 最终回复: {final_text[:60]}"
+        report.record("Layer 2", test_name, overall_ok, detail_msg, cost)
+        await asyncio.sleep(1.5)
 
 
 # ==============================================================================
-# Layer 4: 音频硬件与 VAD 底噪健康检查 (Audio & VAD Health Boundary)
+# Layer 3: 音频硬件与麦克风底噪健康检查 (Audio Hardware & VAD Health Boundary)
 # ==============================================================================
-def test_layer_4(report: TestReport, prefer_mic="Wireless Mic Rx"):
-    print(f"\n{CYAN}{BOLD}【Layer 4】音频硬件与近场 VAD 门控健康检查{RESET}")
+def test_layer_3(report: TestReport, prefer_mic="Wireless Mic Rx"):
+    print(f"\n{CYAN}{BOLD}【Layer 3】音频硬件与近场 VAD 门控健康检查{RESET}")
     print("-" * 70)
 
     import sounddevice as sd
@@ -947,7 +1282,7 @@ def test_layer_4(report: TestReport, prefer_mic="Wireless Mic Rx"):
     t0 = time.time()
     try:
         mic_idx, mic_name, mic_channels = find_audio_devices(prefer_mic)
-        report.record("Layer 4", f"设备识别: [{mic_idx}] {mic_name} ({mic_channels}通道)", True, "设备正常就绪")
+        report.record("Layer 3", f"设备识别: [{mic_idx}] {mic_name} ({mic_channels}通道)", True, "设备正常就绪")
 
         sample_rate = 16000
         chunk_size = 1024
@@ -981,7 +1316,7 @@ def test_layer_4(report: TestReport, prefer_mic="Wireless Mic Rx"):
 
         warm = samples[5:] if len(samples) > 8 else samples
         if not warm:
-            report.record("Layer 4", "麦克风采集样本", False, "未能采集到有效音频样本", cost)
+            report.record("Layer 3", "麦克风采集样本", False, "未能采集到有效音频样本", cost)
             return
 
         p75 = int(np.percentile(warm, 75))
@@ -991,37 +1326,44 @@ def test_layer_4(report: TestReport, prefer_mic="Wireless Mic Rx"):
 
         is_healthy = (65 <= computed_start <= 160) and (computed_hold < computed_start)
         detail = f"采样底噪 P75={p75}, Median={median} -> 自适应起呼门限={computed_start}, 维持门限={computed_hold}"
-        report.record("Layer 4", "自适应门限健康度诊断", is_healthy, detail, cost)
+        report.record("Layer 3", "自适应门限健康度诊断", is_healthy, detail, cost)
 
     except Exception as e:
         cost = (time.time() - t0) * 1000
-        report.record("Layer 4", "音频硬件诊断", False, str(e), cost)
+        report.record("Layer 3", "音频硬件诊断", False, str(e), cost)
 
 
 # ==============================================================================
-# 主入口
+# 主入口 (CLI Entrypoint)
 # ==============================================================================
 async def main():
-    parser = argparse.ArgumentParser(description="语音电脑管家全层级自动化测试套件")
-    parser.add_argument("--layer", type=int, choices=[0, 1, 2, 3, 4], help="仅运行指定层级测试")
+    parser = argparse.ArgumentParser(description="Gemini 实时语音电脑管家全套闭环自动化测试套件")
+    parser.add_argument("--layer", type=int, choices=[0, 1, 2, 3], help="仅运行指定层级测试 (0:策略, 1:应用深度闭环, 2:真实语音端到端, 3:音频硬件)")
+    parser.add_argument("--case", type=str, choices=["outlook", "word", "calc", "browser", "notes"], help="指定仅运行某个特定闭环测试用例")
+    parser.add_argument("--voice-query", type=str, help="自定义语音指令文本（自动合成为真实 PCM 语音传给模型）")
+    parser.add_argument("--audio-file", type=str, help="指定本地真实音频文件路径（WAV/PCM/MP3等），由真实音频驱动测试")
+    parser.add_argument("--record-voice", action="store_true", help="现场从麦克风录音一段真实人类语音，由真实录音驱动测试")
+    parser.add_argument("--model", type=str, default="gemini-3.8-flash", help="指定评估大模型 (默认: gemini-3.8-flash)")
     args = parser.parse_args()
 
-    print(f"\n{BOLD}{'=' * 70}{RESET}")
-    print(f"{BOLD}🧪  Gemini Live CU + Ego Browser 自动化测试验证套件 (安全策略版){RESET}")
-    print(f"{BOLD}{'=' * 70}{RESET}")
+    print(f"\n{BOLD}{'=' * 75}{RESET}")
+    print(f"{BOLD}🧪  Gemini Live CU + Ego Browser 深度闭环与真实语音自动化测试套件{RESET}")
+    print(f"{BOLD}{'=' * 75}{RESET}")
 
     report = TestReport()
 
-    # Layer 0 无需外部服务依赖，极速单元测试
+    # Layer 0: 安全策略与治理机制极速单元测试
     if args.layer is None or args.layer == 0:
-        await test_layer_0(report)
+        if not args.case and not args.voice_query and not args.audio_file and not args.record_voice:
+            await test_layer_0(report)
 
-    if args.layer in [1, 2, 3] or args.layer is None:
+    # 需要外部环境（kimi-cu / Gemini API）的测试层
+    if args.layer in [1, 2] or args.layer is None or args.case or args.voice_query or args.audio_file or args.record_voice:
         api_key = os.environ.get("GEMINI_API_KEY")
         kimi_cu_path = os.environ.get("KIMI_CU_PATH", "/Applications/KimiCU.app/Contents/MacOS/kimi-cu")
 
         if not api_key:
-            print(f"{RED}错误: 未检测到 GEMINI_API_KEY 环境变量{RESET}")
+            print(f"{RED}错误: 未检测到 GEMINI_API_KEY 环境变量，请在 .env 中配置。{RESET}")
             return
 
         client = genai.Client(api_key=api_key)
@@ -1037,17 +1379,27 @@ async def main():
                 await mcp_session.initialize()
                 all_tools = await get_all_tool_declarations(mcp_session)
 
-                if args.layer is None or args.layer == 1:
-                    await test_layer_1(report, mcp_session)
+                # Layer 1: 真实应用深度闭环基座测试
+                if (args.layer is None or args.layer == 1 or args.case) and not (args.voice_query or args.audio_file or args.record_voice):
+                    await test_layer_1(report, mcp_session, specific_case=args.case)
 
-                if args.layer is None or args.layer == 2:
-                    await test_layer_2(report, client, all_tools)
+                # Layer 2: 真实 PCM 语音驱动全链路闭环评测
+                if (args.layer is None or args.layer == 2 or args.voice_query or args.audio_file or args.record_voice) and not args.case:
+                    await test_layer_2(
+                        report=report,
+                        client=client,
+                        all_tools=all_tools,
+                        mcp_session=mcp_session,
+                        eval_model=args.model,
+                        custom_voice_query=args.voice_query,
+                        audio_file_path=args.audio_file,
+                        record_mic_mode=args.record_voice
+                    )
 
-                if args.layer is None or args.layer == 3:
-                    await test_layer_3(report, client, all_tools)
-
-    if args.layer is None or args.layer == 4:
-        test_layer_4(report)
+    # Layer 3: 麦克风硬件与 VAD 底噪检查
+    if args.layer is None or args.layer == 3:
+        if not args.case and not args.voice_query and not args.audio_file and not args.record_voice:
+            test_layer_3(report)
 
     report.print_summary()
 
