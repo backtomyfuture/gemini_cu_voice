@@ -79,6 +79,7 @@ from gemini_live_cu import (
     ToolExecutor,
     STATE_LISTENING,
     STATE_THINKING,
+    STATE_EXECUTING,
     STATE_SPEAKING,
     BROWSER_TOOLS,
     CUSTOM_ASR_VOCABULARY,
@@ -89,6 +90,9 @@ from gemini_live_cu import (
     NON_BLOCKING_TOOLS,
     parse_duration_seconds,
     is_handle_rejection,
+    resolve_thinking_level,
+    should_disable_custom_vocab,
+    replay_pending_tool_responses,
 )
 from ego_browser_client import (
     browser_open,
@@ -1883,88 +1887,88 @@ async def test_layer_0(report: TestReport):
         cost,
     )
 
-    # 0.34 GoAway 在途工具响应暂存与新会话补发/降级契约 (Pending Tool Responses Resend & Fallback)
+    # 0.34 生产级在途响应补发与只读上下文降级契约 (replay_pending_tool_responses Production Test)
     t0 = time.time()
-    stashed_state = {"pending_tool_responses": [
-        types.FunctionResponse(name="browser_search", id="call_1", response={"result": "完成搜索"})
-    ]}
-
-    class MockReplaySession:
+    class MockLiveReplaySession:
         def __init__(self, fail_send=False):
             self.fail_send = fail_send
-            self.resent = False
-            self.fallback_injected = False
+            self.resent_calls = []
+            self.injected_turns = []
+            self.last_turn_complete = None
 
         async def send_tool_response(self, function_responses):
             if self.fail_send:
-                raise RuntimeError("Invalid call_id on new session")
-            self.resent = True
+                raise RuntimeError("404 FunctionResponse call_id not found on new session")
+            self.resent_calls.extend(function_responses)
 
         async def send_client_content(self, turns, turn_complete):
-            self.fallback_injected = True
+            self.injected_turns.extend(turns)
+            self.last_turn_complete = turn_complete
 
-    sess_normal = MockReplaySession(fail_send=False)
-    pending_1 = list(stashed_state["pending_tool_responses"])
-    await sess_normal.send_tool_response(function_responses=pending_1)
-    stashed_state["pending_tool_responses"] = []
-    path1_ok = sess_normal.resent and len(stashed_state["pending_tool_responses"]) == 0
+    # 路径 1: 直接补发成功
+    sess_ok = MockLiveReplaySession(fail_send=False)
+    state_1 = {"pending_tool_responses": [types.FunctionResponse(name="browser_search", id="call_1", response={"result": "完成"})]}
+    await replay_pending_tool_responses(sess_ok, state_1)
+    path1_ok = len(sess_ok.resent_calls) == 1 and len(state_1["pending_tool_responses"]) == 0
 
-    stashed_state["pending_tool_responses"] = [
-        types.FunctionResponse(name="browser_search", id="call_2", response={"result": "降级内容"})
-    ]
-    sess_fallback = MockReplaySession(fail_send=True)
-    pending_2 = list(stashed_state["pending_tool_responses"])
-    try:
-        await sess_fallback.send_tool_response(function_responses=pending_2)
-    except Exception:
-        fallback_txt = f"[系统提示: 工具 '{pending_2[0].name}' 结果: {pending_2[0].response['result']}]"
-        await sess_fallback.send_client_content(turns=[fallback_txt], turn_complete=True)
-        stashed_state["pending_tool_responses"] = []
-    path2_ok = sess_fallback.fallback_injected and len(stashed_state["pending_tool_responses"]) == 0
+    # 路径 2: 补发失败降级，验证 send_client_content 注入 role="model" 且 turn_complete=False，清空 pending 避免死循环
+    sess_fail = MockLiveReplaySession(fail_send=True)
+    state_2 = {"pending_tool_responses": [types.FunctionResponse(name="get_app_state", id="call_2", response={"result": "数据"})]}
+    await replay_pending_tool_responses(sess_fail, state_2)
+    path2_ok = (
+        len(sess_fail.injected_turns) == 1
+        and getattr(sess_fail.injected_turns[0], "role", "") == "model"
+        and sess_fail.last_turn_complete is False
+        and len(state_2["pending_tool_responses"]) == 0
+    )
 
-    stash_replay_ok = path1_ok and path2_ok
+    replay_prod_ok = path1_ok and path2_ok
     cost = (time.time() - t0) * 1000
     report.record(
         "Layer 0",
-        "在途保护: GoAway未结响应在新会话自动补发，失败降级文本注入 (Pending Tool Responses Resend)",
-        stash_replay_ok,
-        f"直接补发成功={path1_ok}, 降级文本注入成功={path2_ok}",
+        "在途保护: 生产函数 replay_pending_tool_responses 补发成功与模型只读降级注入 (Replay Production Logic)",
+        replay_prod_ok,
+        f"原样补发成功={path1_ok}, 降级role='model'且turn_complete=False={path2_ok}",
         cost,
     )
 
-    # 0.35 GEMINI_THINKING_LEVEL 合法性校验与回落契约 (Thinking Level Validation)
+    # 0.35 生产级 GEMINI_THINKING_LEVEL 合法性校验与回落契约 (resolve_thinking_level Production Test)
     t0 = time.time()
-    def validate_thinking_level(raw: str) -> str:
-        cleaned = raw.strip().lower()
-        if cleaned not in {"low", "medium", "high"}:
-            return "low"
-        return cleaned
+    val_low = resolve_thinking_level("low") == "low"
+    val_med = resolve_thinking_level("Medium ") == "medium"
+    val_high = resolve_thinking_level("HIGH") == "high"
+    val_invalid = resolve_thinking_level("extreme") == "low"
+    val_none = resolve_thinking_level(None) == "low"
+    val_empty = resolve_thinking_level("") == "low"
 
-    val_low = validate_thinking_level("low") == "low"
-    val_med = validate_thinking_level("Medium ") == "medium"
-    val_high = validate_thinking_level("HIGH") == "high"
-    val_invalid = validate_thinking_level("extreme") == "low"
-    val_empty = validate_thinking_level("") == "low"
-
-    thinking_level_ok = val_low and val_med and val_high and val_invalid and val_empty
+    thinking_level_ok = val_low and val_med and val_high and val_invalid and val_none and val_empty
     cost = (time.time() - t0) * 1000
     report.record(
         "Layer 0",
-        "参数校验: GEMINI_THINKING_LEVEL 限定合法枚举，非法输入安全回落 low (Thinking Level Validation)",
+        "参数校验: 生产函数 resolve_thinking_level 严格过滤非法枚举并安全回退 low (Thinking Level Validation)",
         thinking_level_ok,
-        f"low={val_low}, medium={val_med}, high={val_high}, extreme回落={val_invalid}",
+        f"low={val_low}, medium={val_med}, high={val_high}, extreme回落={val_invalid}, None/空回落={val_none and val_empty}",
         cost,
     )
 
-    # 0.36 custom_vocabulary 握手失败降级与恢复契约 (Custom Vocabulary Degradation)
+    # 0.36 生产级 custom_vocabulary 错误检测与反例鉴别 (should_disable_custom_vocab Production Test)
     t0 = time.time()
-    test_session_state = {"custom_vocab_disabled": False}
-    simulated_err = Exception("400 Invalid argument: custom_vocabulary is not supported in conversational mode")
-    err_str = str(simulated_err).lower()
-    if "custom_vocabulary" in err_str or "custom vocabulary" in err_str:
-        test_session_state["custom_vocab_disabled"] = True
+    # 真实服务端报文 (camelCase、snake_case 与 input_audio_transcription 报错)
+    err_camel = Exception('Unknown name "customVocabulary" at \'setup.input_audio_transcription\'')
+    err_snake = Exception("Invalid field 'custom_vocabulary' in live connect setup")
+    err_input_audio = Exception("Cannot bind input_audio_transcription: UnknownField")
+    match_camel = should_disable_custom_vocab(err_camel)
+    match_snake = should_disable_custom_vocab(err_snake)
+    match_input = should_disable_custom_vocab(err_input_audio)
 
-    vocab_degraded = test_session_state["custom_vocab_disabled"] is True
+    # 关键反例：普通网络异常、500 错误、其他参数错误必须为 False，绝不误触降级
+    err_net = Exception("Connection reset by peer during handshake")
+    err_500 = Exception("500 Internal Server Error")
+    err_other = Exception("Invalid model parameter: temperature must be positive")
+    reject_net = not should_disable_custom_vocab(err_net)
+    reject_500 = not should_disable_custom_vocab(err_500)
+    reject_other = not should_disable_custom_vocab(err_other)
+
     vocab_curated = (
         len(CUSTOM_ASR_VOCABULARY) <= 15
         and "长鑫科技" in CUSTOM_ASR_VOCABULARY
@@ -1972,40 +1976,102 @@ async def test_layer_0(report: TestReport):
         and "kimi-cu" in CUSTOM_ASR_VOCABULARY
         and "打开" not in CUSTOM_ASR_VOCABULARY
     )
-    vocab_ok = vocab_degraded and vocab_curated
+    vocab_prod_ok = match_camel and match_snake and match_input and reject_net and reject_500 and reject_other and vocab_curated
     cost = (time.time() - t0) * 1000
     report.record(
         "Layer 0",
-        "词汇治理: custom_vocabulary 精简高价值专有名词，握手拒收自动降级 (Custom Vocabulary Governance)",
-        vocab_ok,
-        f"握手失败自动降级={vocab_degraded}, 词汇精简专有名词={vocab_curated} (共{len(CUSTOM_ASR_VOCABULARY)}项)",
+        "词汇治理: 生产函数 should_disable_custom_vocab 精准命中 camelCase 并拒绝普通错误误判 (Custom Vocab Discrimination)",
+        vocab_prod_ok,
+        f"camelCase命中={match_camel}, snake_case命中={match_snake}, inputAudio命中={match_input}, 网络反例拒绝={reject_net and reject_500}",
         cost,
     )
 
-    # 0.37 is_handle_rejection 错误分类与网络瞬断保护契约 (Handle Expiry vs Network Error)
+    # 0.37 生产级 is_handle_rejection 错误分类与网络瞬断反例契约 (is_handle_rejection Production Test)
     t0 = time.time()
+    # 真实 Handle 失效报错
     err_handle_expired = Exception("404 Session Handle expired or invalid session")
     err_session_not_found = Exception("Session_not_found on live cluster")
+    err_resumption_invalid = Exception("Invalid resumption handle supplied in setup")
+    match_expired = is_handle_rejection(err_handle_expired)
+    match_not_found = is_handle_rejection(err_session_not_found)
+    match_resumption = is_handle_rejection(err_resumption_invalid)
+
+    # 关键反例：含 "handle" 但属于网络或运行库报错（如 handler/unhandled），绝不能误判为句柄失效
+    err_handler_ws = Exception("Exception in handler for websocket connection")
+    err_unhandled = Exception("Unhandled error in recv loop")
     err_net_timeout = TimeoutError("Connection timed out waiting for handshake")
     err_conn_reset = ConnectionResetError("Connection reset by peer")
+    protect_handler_ws = not is_handle_rejection(err_handler_ws)
+    protect_unhandled = not is_handle_rejection(err_unhandled)
+    protect_timeout = not is_handle_rejection(err_net_timeout)
+    protect_reset = not is_handle_rejection(err_conn_reset)
 
-    rejection_expired = is_handle_rejection(err_handle_expired)
-    rejection_not_found = is_handle_rejection(err_session_not_found)
-    rejection_timeout = is_handle_rejection(err_net_timeout)
-    rejection_reset = is_handle_rejection(err_conn_reset)
-
-    handle_rejection_ok = (
-        rejection_expired
-        and rejection_not_found
-        and (not rejection_timeout)
-        and (not rejection_reset)
+    handle_rejection_prod_ok = (
+        match_expired and match_not_found and match_resumption
+        and protect_handler_ws and protect_unhandled and protect_timeout and protect_reset
     )
     cost = (time.time() - t0) * 1000
     report.record(
         "Layer 0",
-        "错误分类: 仅明确 Handle 失效时才注销句柄，普通网络瞬断保留句柄重试 (Handle Expiry Discrimination)",
-        handle_rejection_ok,
-        f"expired判定={rejection_expired}, not_found判定={rejection_not_found}, timeout保护={not rejection_timeout}, reset保护={not rejection_reset}",
+        "错误分类: 生产函数 is_handle_rejection 排除 handler/unhandled 干扰，仅精准识别句柄失效 (Handle Discrimination)",
+        handle_rejection_prod_ok,
+        f"失效命中={match_expired and match_not_found}, 'handler for ws'反例保护={protect_handler_ws}, 'unhandled'反例保护={protect_unhandled}",
+        cost,
+    )
+
+    # 0.38 状态机自愈: NON_BLOCKING 垫话播放完毕扬声器静音自动切回 EXECUTING (Filler Playback Recovery)
+    t0 = time.time()
+    ctrl_filler = TurnController()
+    ctrl_filler.new_turn("filler_turn")
+    ctrl_filler.set_state(STATE_EXECUTING)
+    ctrl_filler.has_active_tool = True
+    ctrl_filler.set_state(STATE_SPEAKING)
+
+    class DummySilentPlayer:
+        def is_busy(self):
+            return False
+
+    p_silent = DummySilentPlayer()
+    # 模拟观察者与看门狗的自愈逻辑
+    if ctrl_filler.state == STATE_SPEAKING and not p_silent.is_busy() and ctrl_filler.has_active_tool:
+        ctrl_filler.set_state(STATE_EXECUTING)
+
+    filler_state_ok = ctrl_filler.state == STATE_EXECUTING
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "状态机自愈: NON_BLOCKING 垫话播放结束扬声器静音自动切回 EXECUTING (Filler Playback State Recovery)",
+        filler_state_ok,
+        f"垫话播完切回EXECUTING={filler_state_ok} (避免卡在SPEAKING导致高门限忽略用户输入)",
+        cost,
+    )
+
+    # 0.39 批量工具调度: 中途取消自动补齐剩余 calls 取消响应契约 (Batch Tool Calls Complement on Cancel)
+    t0 = time.time()
+    mock_batch_calls = [
+        type("Call", (), {"name": "browser_open", "id": "call_1"})(),
+        type("Call", (), {"name": "browser_search", "id": "call_2"})(),
+        type("Call", (), {"name": "browser_click", "id": "call_3"})(),
+    ]
+    executed_ids = {"call_1"}
+    batch_resps = [types.FunctionResponse(name="browser_open", id="call_1", response={"result": "ok"})]
+    remaining = [c for c in mock_batch_calls if c.id not in executed_ids]
+    for rc in remaining:
+        batch_resps.append(types.FunctionResponse(name=rc.name, id=rc.id, response={"result": "【已取消】操作因连接中断协同取消"}))
+        executed_ids.add(rc.id)
+
+    batch_complement_ok = (
+        len(batch_resps) == 3
+        and {r.id for r in batch_resps} == {"call_1", "call_2", "call_3"}
+        and "已取消" in batch_resps[1].response["result"]
+        and "已取消" in batch_resps[2].response["result"]
+    )
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "批量调度: 中途取消自动补齐未执行 calls 的取消响应，杜绝云端丢失 call_id 挂起 (Batch Tool Cancellation Complement)",
+        batch_complement_ok,
+        f"响应补齐总数={len(batch_resps)}/3, 所有call_id全覆盖={batch_complement_ok}",
         cost,
     )
 

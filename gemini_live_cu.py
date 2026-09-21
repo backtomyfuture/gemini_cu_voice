@@ -591,7 +591,11 @@ CLIENT_SILENCE_CHUNKS = 12  # 客户端本地近场断句帧数 (12 * 64ms = 768
 
 
 def parse_duration_seconds(duration_str: Optional[str], default: float = 3.0) -> float:
-    """解析服务端返回的时间字符串（例如 '5s', '10.5s'）为秒数浮点值"""
+    """
+    解析服务端返回的时间字符串（例如 '5s', '10.5s'）为秒数浮点值。
+    注意：在 GoAway 处理中，等待在途任务上限通常被限制为 3.0 秒，这是有意的工程取舍（Trade-off）：
+    GoAway 属于紧急停机信令，等待预算限定在 3 秒是为了避免阻塞重连，未完成的物理长操作将通过 CancelledError 流程补齐取消响应。
+    """
     if not duration_str:
         return default
     try:
@@ -603,10 +607,103 @@ def parse_duration_seconds(duration_str: Optional[str], default: float = 3.0) ->
         return default
 
 
+def resolve_thinking_level(raw_level: Optional[str]) -> str:
+    """
+    校验并解析 GEMINI_THINKING_LEVEL，限定合法值为 {'low', 'medium', 'high'}。
+    非法输入或留空安全回退为 'low'。
+    """
+    if not raw_level:
+        return "low"
+    cleaned = str(raw_level).strip().lower()
+    if cleaned in {"low", "medium", "high"}:
+        return cleaned
+    return "low"
+
+
+def should_disable_custom_vocab(err: Exception) -> bool:
+    """
+    判断建连异常是否由 custom_vocabulary 引起。
+    支持标准化匹配 camelCase（如 Unknown name "customVocabulary"）、snake_case 及字段绑定错误。
+    """
+    err_str = str(err)
+    clean_msg = re.sub(r"[\s_\-]+", "", err_str.lower())
+    if "customvocabulary" in clean_msg:
+        return True
+    if "inputaudiotranscription" in clean_msg and any(
+        k in clean_msg for k in ["unknownname", "unknownfield", "invalidargument", "cannotbind", "cannotparse"]
+    ):
+        return True
+    if "vocabulary" in clean_msg and any(k in clean_msg for k in ["400", "invalid", "unknown", "unsupported"]):
+        return True
+    return False
+
+
 def is_handle_rejection(err: Exception) -> bool:
-    """仅当错误信息明确表明 Handle 过期、失效或 400 参数非法时判定为 Handle 失效；普通网络瞬断保留 Handle"""
+    """
+    仅当错误信息明确表明会话恢复 Handle 过期、失效或无效会话时判定为 Handle 失效。
+    使用高特异性短语，严禁匹配孤立的 'handle'（避免误杀 'handler for websocket'、'Unhandled error' 等网络瞬态故障）。
+    """
     err_msg = str(err).lower()
-    return any(k in err_msg for k in ["handle", "expired", "invalid session", "not found", "404", "session_not_found"])
+    specific_patterns = [
+        "resumption handle",
+        "resumption_handle",
+        "invalid handle",
+        "handle expired",
+        "expired handle",
+        "handle is expired",
+        "handle is invalid",
+        "session not found",
+        "session_not_found",
+        "invalid session",
+        "session has expired",
+        "resumption token",
+    ]
+    if any(p in err_msg for p in specific_patterns):
+        return True
+
+    # 检查状态码与句柄的联合特征
+    if ("404" in err_msg or "1008" in err_msg or "1007" in err_msg) and any(
+        k in err_msg for k in ["session", "resumption"]
+    ):
+        return True
+
+    return False
+
+
+async def replay_pending_tool_responses(session: Any, session_state: Dict[str, Any]) -> None:
+    """
+    在新建立的 Live 会话中重放因网络断线或 GoAway 调度暂存的在途工具响应。
+    优先通过 session.send_tool_response 重放；
+    若 call_id 在新会话不被接受，则降级为通过 send_client_content 注入只读上下文（role='model', turn_complete=False，绝不触发模型插话）。
+    无论成功或失败，重放后均清空暂存，杜绝死循环堆积。
+    """
+    pending_responses = session_state.get("pending_tool_responses")
+    if not pending_responses:
+        return
+
+    try:
+        await session.send_tool_response(function_responses=pending_responses)
+        log_event("PENDING_TOOL_RESPONSES_RESENT", f"Successfully resent {len(pending_responses)} pending tool responses to new session")
+        sys.stdout.write(f"\r⚡ [\033[1;36m已恢复重放前序在途的 {len(pending_responses)} 项工具操作结果\033[0m]                       \n")
+        sys.stdout.flush()
+        session_state["pending_tool_responses"] = []
+    except Exception as e:
+        log_event("PENDING_TOOL_RESEND_FAIL", f"Failed to resend tool responses directly ({e}), falling back to text injection")
+        fallback_text = "\n".join([
+            f"[前序会话执行完成的工具 '{getattr(r, 'name', 'tool')}' 结果: {getattr(r, 'response', {}).get('result', {}) if isinstance(getattr(r, 'response', None), dict) else getattr(r, 'response', {})}]"
+            for r in pending_responses
+        ])
+        try:
+            # 必须使用 role="model" 且 turn_complete=False，仅作为历史上下文记录注入，绝不触发模型打断与主动出声回复
+            await session.send_client_content(
+                turns=[types.Content(role="model", parts=[types.Part.from_text(text=fallback_text)])],
+                turn_complete=False
+            )
+            log_event("PENDING_TOOL_FALLBACK_INJECTED", "Injected pending tool results via model content fallback")
+            session_state["pending_tool_responses"] = []
+        except Exception as fb_err:
+            log_event("PENDING_TOOL_FALLBACK_FAIL", f"Fallback injection also failed: {fb_err}")
+            session_state["pending_tool_responses"] = []
 
 
 def build_gemini_function_declarations(
@@ -1139,11 +1236,11 @@ async def run_session(
 
     thinking_config = None
     if "thinking" in selected_model:
-        raw_level = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip().lower()
-        if raw_level not in {"low", "medium", "high"}:
-            log_event("THINKING_LEVEL_INVALID", f"Invalid GEMINI_THINKING_LEVEL '{raw_level}', falling back to 'low'")
-            raw_level = "low"
-        thinking_config = types.ThinkingConfig(include_thoughts=True, thinking_level=raw_level)
+        raw_env = os.environ.get("GEMINI_THINKING_LEVEL", "low")
+        resolved_level = resolve_thinking_level(raw_env)
+        if raw_env and raw_env.strip().lower() not in {"low", "medium", "high"}:
+            log_event("THINKING_LEVEL_INVALID", f"Invalid GEMINI_THINKING_LEVEL '{raw_env}', falling back to '{resolved_level}'")
+        thinking_config = types.ThinkingConfig(include_thoughts=True, thinking_level=resolved_level)
 
     last_resumption_handle = session_state.get("handle")
     session_resumption_cfg = (
@@ -1442,30 +1539,8 @@ async def run_session(
                 sys.stdout.write(f"\r⚡ [\033[1;36m已通过官方 Handle 无缝恢复 Live 会话\033[0m]                       \n")
                 sys.stdout.flush()
 
-            # 核心：补发因网络断线或 GoAway 暂存的在途工具响应 (Pending Tool Responses)
-            pending_responses = session_state.get("pending_tool_responses")
-            if pending_responses:
-                try:
-                    await session.send_tool_response(function_responses=pending_responses)
-                    log_event("PENDING_TOOL_RESPONSES_RESENT", f"Successfully resent {len(pending_responses)} pending tool responses to new session")
-                    sys.stdout.write(f"\r⚡ [\033[1;36m已恢复重放前序在途的 {len(pending_responses)} 项工具操作结果\033[0m]                       \n")
-                    sys.stdout.flush()
-                    session_state["pending_tool_responses"] = []
-                except Exception as e:
-                    log_event("PENDING_TOOL_RESEND_FAIL", f"Failed to resend tool responses directly ({e}), falling back to text injection")
-                    fallback_text = "\n".join([
-                        f"[系统提示: 在重连前后台执行完毕的工具 '{getattr(r, 'name', 'tool')}' 结果: {getattr(r, 'response', {}).get('result', {}) if isinstance(getattr(r, 'response', None), dict) else getattr(r, 'response', {})}]"
-                        for r in pending_responses
-                    ])
-                    try:
-                        await session.send_client_content(
-                            turns=[types.Content(role="user", parts=[types.Part.from_text(text=fallback_text)])],
-                            turn_complete=True
-                        )
-                        log_event("PENDING_TOOL_FALLBACK_INJECTED", "Injected pending tool results via client_content fallback")
-                        session_state["pending_tool_responses"] = []
-                    except Exception as fb_err:
-                        log_event("PENDING_TOOL_FALLBACK_FAIL", f"Fallback injection also failed: {fb_err}")
+            # 补发因网络断线或 GoAway 暂存的在途工具响应 (Pending Tool Responses)
+            await replay_pending_tool_responses(session, session_state)
 
             handshake_done = True
 
@@ -1521,6 +1596,30 @@ async def run_session(
                         idle_sec = time.time() - turn_ctrl.state_start_time
                         if idle_sec > 12.0:
                             log_event("THINKING_TIMEOUT_RECOVER", f"Server silent for {idle_sec:.1f}s, auto-recovering to LISTENING")
+                            turn_ctrl.set_state(STATE_LISTENING)
+                            sys.stdout.write(f"\r🟢 [\033[1;32m连接就绪，请直接对麦克风说话\033[0m] (起呼门限: {START_THRESHOLD})                 \n")
+                            sys.stdout.flush()
+
+                    # 1.2 垫话播放完毕状态自愈：若处于 SPEAKING 状态但扬声器已静音且仍有活动工具，立即回切至 EXECUTING
+                    if (
+                        turn_ctrl.state == STATE_SPEAKING
+                        and not player.is_busy()
+                        and turn_ctrl.has_active_tool
+                    ):
+                        log_event("SPEAKING_TO_EXECUTING_RECOVER", "Audio playback finished while tool still executing, switching state to EXECUTING")
+                        turn_ctrl.set_state(STATE_EXECUTING)
+                        sys.stdout.write(f"\r⚙️ [\033[1;33m后台动作继续执行中...\033[0m]                                      \n")
+                        sys.stdout.flush()
+
+                    # 1.3 播报残留状态自愈：若处于 SPEAKING 状态但扬声器静音超过 1.0 秒且无活动工具，回退至 LISTENING
+                    if (
+                        turn_ctrl.state == STATE_SPEAKING
+                        and not player.is_busy()
+                        and not turn_ctrl.has_active_tool
+                    ):
+                        idle_sec = time.time() - turn_ctrl.state_start_time
+                        if idle_sec > 1.0:
+                            log_event("SPEAKING_ORPHAN_RECOVER", f"Playback idle in SPEAKING without active tool for {idle_sec:.1f}s, auto-recovering to LISTENING")
                             turn_ctrl.set_state(STATE_LISTENING)
                             sys.stdout.write(f"\r🟢 [\033[1;32m连接就绪，请直接对麦克风说话\033[0m] (起呼门限: {START_THRESHOLD})                 \n")
                             sys.stdout.flush()
@@ -1585,6 +1684,7 @@ async def run_session(
                         log_event("TOOL_TOKEN_CANCELLED", f"Tools task cancelled: reason={token.cancel_reason}, turn={target_turn_id}")
                         return
                     function_responses = []
+                    executed_call_ids = set()
                     for call in tool_call.function_calls:
                         if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
                             break
@@ -1612,6 +1712,7 @@ async def run_session(
                             if sched is not None:
                                 resp_kwargs["scheduling"] = sched
                             function_responses.append(types.FunctionResponse(**resp_kwargs))
+                            executed_call_ids.add(call.id)
                             continue
 
                         log_event("TOOL_CALL", f"Calling {func_name} with args: {func_args}")
@@ -1633,6 +1734,7 @@ async def run_session(
                         if sched is not None:
                             resp_kwargs["scheduling"] = sched
                         function_responses.append(types.FunctionResponse(**resp_kwargs))
+                        executed_call_ids.add(call.id)
 
                     if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
                         log_event("TOOL_CANCELLED_DROP", f"Tools result dropped due to turn cancellation (turn {target_turn_id})")
@@ -1648,13 +1750,31 @@ async def run_session(
                                 turn_ctrl.set_state(STATE_THINKING)
                         except Exception as send_err:
                             log_event("TOOL_RESPONSE_SEND_FAIL", f"Failed to send tool response: {send_err}. Stashing into pending_tool_responses.")
+                            # 为剩余未执行的 calls 补齐取消响应
+                            remaining_calls = [c for c in getattr(tool_call, "function_calls", []) if c.id not in executed_call_ids]
+                            for rc in remaining_calls:
+                                function_responses.append(types.FunctionResponse(
+                                    name=rc.name,
+                                    id=rc.id,
+                                    response={"result": "【已取消】操作因连接中断协同取消"}
+                                ))
+                                executed_call_ids.add(rc.id)
                             pending_list = session_state.setdefault("pending_tool_responses", [])
                             pending_list.extend(function_responses)
                             raise send_err
                 except asyncio.CancelledError:
                     log_event("TOOL_TASK_CANCELLED", f"Active tool task cancelled for turn {target_turn_id}")
+                    # 为剩余未执行的 calls 补齐取消响应
+                    remaining_calls = [c for c in getattr(tool_call, "function_calls", []) if c.id not in executed_call_ids]
+                    for rc in remaining_calls:
+                        function_responses.append(types.FunctionResponse(
+                            name=rc.name,
+                            id=rc.id,
+                            response={"result": "【已取消】操作因 GoAway 或轮次打断协同取消"}
+                        ))
+                        executed_call_ids.add(rc.id)
                     if function_responses and go_away_time_left is not None:
-                        log_event("STASH_GOAWAY_CANCELLED_TOOL", f"Stashing {len(function_responses)} tool responses cancelled during GoAway")
+                        log_event("STASH_GOAWAY_CANCELLED_TOOL", f"Stashing {len(function_responses)} tool responses (including {len(remaining_calls)} cancelled) during GoAway")
                         pending_list = session_state.setdefault("pending_tool_responses", [])
                         pending_list.extend(function_responses)
                 except Exception as e:
@@ -1671,6 +1791,15 @@ async def run_session(
             # 接收循环：常驻监听，使用公开 session.receive() 迭代器
             async def recv_loop():
                 nonlocal current_user_transcript, current_model_transcript, current_tools_executed, go_away_time_left
+
+                def record_vad_race_winner(trigger_event: str):
+                    nonlocal turn_vad_recorded
+                    if not turn_vad_recorded:
+                        turn_vad_recorded = True
+                        if is_speaking:
+                            log_event("SERVER_VAD_WON", f"Server VAD won race (triggered by '{trigger_event}' while client is_speaking=True)")
+                        else:
+                            log_event("CLIENT_VAD_WON", f"Client near-field VAD won race (fast path, event='{trigger_event}')")
 
                 try:
                     while not shutdown_event.is_set() and not reconnect_event.is_set():
@@ -1713,6 +1842,7 @@ async def run_session(
 
                             # 1. 检查服务端打断信号 (仅在客户端正处于播报态时才打断轮次，绝不误杀客户端已开辟的新轮次Token)
                             if response.server_content and response.server_content.interrupted:
+                                record_vad_race_winner("server_interrupted")
                                 player.interrupt()
                                 if turn_ctrl.state == STATE_SPEAKING:
                                     turn_ctrl.interrupt("Server reported interrupted")
@@ -1721,6 +1851,7 @@ async def run_session(
                             # 1.5 语音实时转录展示与收集
                             if response.server_content:
                                 if response.server_content.input_transcription and response.server_content.input_transcription.text:
+                                    record_vad_race_winner("input_transcription")
                                     txt = response.server_content.input_transcription.text.strip()
                                     if txt:
                                         current_user_transcript.append(txt)
@@ -1739,12 +1870,7 @@ async def run_session(
 
                             # 2. 模型回复内容（思考、文本与音频）
                             if response.server_content and response.server_content.model_turn:
-                                if not turn_vad_recorded:
-                                    turn_vad_recorded = True
-                                    if is_speaking:
-                                        log_event("SERVER_VAD_WON", "Server VAD triggered turn completion before client finished (server won race)")
-                                    else:
-                                        log_event("CLIENT_VAD_WON", "Client near-field VAD won race (fast path)")
+                                record_vad_race_winner("model_turn")
                                 turn_ctrl.waiting_tool_summary = False
                                 for part in response.server_content.model_turn.parts:
                                     if part.text:
@@ -1761,9 +1887,21 @@ async def run_session(
                                             continue
                                         turn_ctrl.set_state(STATE_SPEAKING)
                                         player.write(part.inline_data.data)
+                                        if turn_ctrl.has_active_tool:
+                                            # NON_BLOCKING 垫话播放：异步观察扬声器，播放完毕立即切回 EXECUTING 避免状态机挂在 SPEAKING
+                                            current_turn = turn_ctrl.current_turn_id
+                                            async def observe_filler_done(tid: int):
+                                                await asyncio.sleep(0.08)
+                                                while player.is_busy():
+                                                    await asyncio.sleep(0.03)
+                                                if turn_ctrl.is_current_turn(tid) and turn_ctrl.state == STATE_SPEAKING and turn_ctrl.has_active_tool:
+                                                    turn_ctrl.set_state(STATE_EXECUTING)
+                                                    log_event("FILLER_PLAYBACK_DONE", f"Filler speech finished for turn {tid}, state returned to EXECUTING")
+                                            asyncio.create_task(observe_filler_done(current_turn))
 
                             # 3. 工具调用请求（异步解耦至独立后台任务，绝不阻塞 recv_loop）
                             if response.tool_call:
+                                record_vad_race_winner("tool_call")
                                 turn_ctrl.waiting_tool_summary = False
                                 turn_ctrl.set_state(STATE_EXECUTING)
                                 turn_id = turn_ctrl.current_turn_id
@@ -1861,8 +1999,7 @@ async def run_session(
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        err_msg = str(e).lower()
-        if "custom_vocabulary" in err_msg or "custom vocabulary" in err_msg:
+        if should_disable_custom_vocab(e):
             log_event("CUSTOM_VOCAB_DISABLED", f"Server rejected custom_vocabulary ({e}), disabling for subsequent sessions")
             session_state["custom_vocab_disabled"] = True
 
