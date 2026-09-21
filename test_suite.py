@@ -93,6 +93,8 @@ from gemini_live_cu import (
     resolve_thinking_level,
     should_disable_custom_vocab,
     replay_pending_tool_responses,
+    evaluate_watchdog_state,
+    evaluate_vad_race,
 )
 from ego_browser_client import (
     browser_open,
@@ -2019,30 +2021,58 @@ async def test_layer_0(report: TestReport):
         cost,
     )
 
-    # 0.38 状态机自愈: NON_BLOCKING 垫话播放完毕扬声器静音自动切回 EXECUTING (Filler Playback Recovery)
+    # 0.38 生产级看门狗状态自愈与静音去抖回归契约 (evaluate_watchdog_state Production Test)
     t0 = time.time()
-    ctrl_filler = TurnController()
-    ctrl_filler.new_turn("filler_turn")
-    ctrl_filler.set_state(STATE_EXECUTING)
-    ctrl_filler.has_active_tool = True
-    ctrl_filler.set_state(STATE_SPEAKING)
+    # 场景 A: 关键回归风险防范——正常播报进行到 1.2s，发生短暂网络空洞/抖动 200ms (silent_duration=0.2 < 1.0)
+    # 必须断言维持 SPEAKING (返回 None)，绝不误切回 LISTENING 自打断！
+    stay_speaking = evaluate_watchdog_state(
+        current_state=STATE_SPEAKING,
+        has_active_tool=False,
+        silent_duration=0.2,
+        state_idle_sec=1.2,
+    ) is None
 
-    class DummySilentPlayer:
-        def is_busy(self):
-            return False
+    # 场景 B: 抖动恢复，扬声器继续发声 (silent_duration=0.0) 依然维持 SPEAKING
+    recover_playing = evaluate_watchdog_state(
+        current_state=STATE_SPEAKING,
+        has_active_tool=False,
+        silent_duration=0.0,
+        state_idle_sec=2.5,
+    ) is None
 
-    p_silent = DummySilentPlayer()
-    # 模拟观察者与看门狗的自愈逻辑
-    if ctrl_filler.state == STATE_SPEAKING and not p_silent.is_busy() and ctrl_filler.has_active_tool:
-        ctrl_filler.set_state(STATE_EXECUTING)
+    # 场景 C: 垫话播放完成，静音去抖验证
+    # 连续静音仅 0.15s (<0.3s) 维持原状
+    filler_debouncing = evaluate_watchdog_state(
+        current_state=STATE_SPEAKING,
+        has_active_tool=True,
+        silent_duration=0.15,
+        state_idle_sec=1.0,
+    ) is None
+    # 连续静音达到 0.35s (>=0.3s) 准确切回 EXECUTING
+    filler_cut_exec = evaluate_watchdog_state(
+        current_state=STATE_SPEAKING,
+        has_active_tool=True,
+        silent_duration=0.35,
+        state_idle_sec=1.0,
+    ) == STATE_EXECUTING
 
-    filler_state_ok = ctrl_filler.state == STATE_EXECUTING
+    # 场景 D: 无 turn_complete 播报残留极端兜底 (连续静音 >= 1.0s)
+    speaking_orphan_cut = evaluate_watchdog_state(
+        current_state=STATE_SPEAKING,
+        has_active_tool=False,
+        silent_duration=1.05,
+        state_idle_sec=3.0,
+    ) == STATE_LISTENING
+
+    watchdog_eval_ok = (
+        stay_speaking and recover_playing and filler_debouncing and filler_cut_exec and speaking_orphan_cut
+    )
     cost = (time.time() - t0) * 1000
     report.record(
         "Layer 0",
-        "状态机自愈: NON_BLOCKING 垫话播放结束扬声器静音自动切回 EXECUTING (Filler Playback State Recovery)",
-        filler_state_ok,
-        f"垫话播完切回EXECUTING={filler_state_ok} (避免卡在SPEAKING导致高门限忽略用户输入)",
+        "状态机去抖: 生产函数 evaluate_watchdog_state 严密防范正常播报抖动误切并去抖自愈 (Watchdog Debounce Gate)",
+        watchdog_eval_ok,
+        f"播报1.2s遇200ms抖动不误切={stay_speaking}, 垫话0.3s去抖切回EXECUTING={filler_cut_exec}, 播报连续静音1.0s兜底={speaking_orphan_cut}",
         cost,
     )
 
@@ -2072,6 +2102,56 @@ async def test_layer_0(report: TestReport):
         "批量调度: 中途取消自动补齐未执行 calls 的取消响应，杜绝云端丢失 call_id 挂起 (Batch Tool Cancellation Complement)",
         batch_complement_ok,
         f"响应补齐总数={len(batch_resps)}/3, 所有call_id全覆盖={batch_complement_ok}",
+        cost,
+    )
+
+    # 0.40 生产级 Hybrid VAD 竞速胜负与 delta_ms 判定契约 (evaluate_vad_race Production Test)
+    t0 = time.time()
+    # 场景 A: 客户端快路径领先发出 audio_stream_end
+    client_sent_t = 100.0
+    server_resp_t = 100.432
+    winner_client, delta_ms = evaluate_vad_race(client_sent_t, now=server_resp_t)
+    client_won_ok = (winner_client == "CLIENT_VAD_WON") and abs(delta_ms - 432.0) < 1e-3
+
+    # 场景 B: 服务端先行响应，客户端尚未完成静音断句
+    winner_server, delta_none = evaluate_vad_race(None, now=server_resp_t)
+    server_won_ok = (winner_server == "SERVER_VAD_WON") and (delta_none is None)
+
+    vad_race_prod_ok = client_won_ok and server_won_ok
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "VAD 判定: 生产函数 evaluate_vad_race 精确度量快路径领先 delta_ms 且无偏反映胜负 (VAD Race Evaluation)",
+        vad_race_prod_ok,
+        f"客户端领先判定={client_won_ok} (delta={delta_ms:.1f}ms), 服务端领先判定={server_won_ok}",
+        cost,
+    )
+
+    # 0.41 生产级在途响应全新会话无句柄直降文本注入契约 (No Handle Direct Text Injection Test)
+    t0 = time.time()
+    mock_session_no_handle = mock.AsyncMock()
+    mock_session_no_handle.send_tool_response = mock.AsyncMock()
+    mock_session_no_handle.send_client_content = mock.AsyncMock()
+    st_no_handle = {
+        "pending_tool_responses": [
+            types.FunctionResponse(name="browser_open", id="c1", response={"result": "done"})
+        ]
+    }
+    await replay_pending_tool_responses(mock_session_no_handle, st_no_handle, has_resumption_handle=False)
+    direct_inject_called = mock_session_no_handle.send_client_content.called
+    tool_resp_not_called = not mock_session_no_handle.send_tool_response.called
+    stash_emptied = len(st_no_handle["pending_tool_responses"]) == 0
+    call_args = mock_session_no_handle.send_client_content.call_args
+    role_ok = call_args.kwargs.get("turns", [None])[0].role == "model"
+    tc_ok = call_args.kwargs.get("turn_complete") is False
+
+    no_handle_prod_ok = direct_inject_called and tool_resp_not_called and stash_emptied and role_ok and tc_ok
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "在途治理: 生产函数 replay_pending_tool_responses 无句柄直接降级文本注入，省去必败请求 (No Handle Direct Injection)",
+        no_handle_prod_ok,
+        f"直接注入={direct_inject_called}, 未调必败接口={tool_resp_not_called}, 暂存已清空={stash_emptied}, role='model'={role_ok}",
         cost,
     )
 

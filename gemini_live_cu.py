@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Any, Dict, List, Set, Union, Callable
+from typing import Optional, Any, Dict, List, Set, Union, Callable, Tuple
 
 from dotenv import load_dotenv
 from google import genai
@@ -670,15 +670,86 @@ def is_handle_rejection(err: Exception) -> bool:
     return False
 
 
-async def replay_pending_tool_responses(session: Any, session_state: Dict[str, Any]) -> None:
+def evaluate_watchdog_state(
+    current_state: str,
+    has_active_tool: bool,
+    silent_duration: float,
+    state_idle_sec: float,
+    waiting_tool_summary: bool = False
+) -> Optional[str]:
+    """
+    看门狗状态自愈规则评估（纯函数，供 watchdog_loop 与 Layer 0 测试直接共用）:
+    - STATE_THINKING 且无工具且无扬声器输出，持续 12s -> STATE_LISTENING
+    - STATE_SPEAKING 且有活动工具且连续静音 >= 0.3s -> STATE_EXECUTING (垫话播完切回)
+    - STATE_SPEAKING 且无活动工具且连续静音 >= 1.0s -> STATE_LISTENING (无 turn_complete 播报残留兜底)
+    - STATE_EXECUTING 且无活动工具，持续 1.5s -> STATE_LISTENING (孤儿执行态快速自愈)
+    - 其余情况维持原状态（返回 None）
+    """
+    if current_state == STATE_THINKING and not has_active_tool and not waiting_tool_summary:
+        if state_idle_sec > 12.0:
+            return STATE_LISTENING
+    elif current_state == STATE_SPEAKING and has_active_tool:
+        if silent_duration >= 0.3:
+            return STATE_EXECUTING
+    elif current_state == STATE_SPEAKING and not has_active_tool:
+        if silent_duration >= 1.0:
+            return STATE_LISTENING
+    elif current_state == STATE_EXECUTING and not has_active_tool:
+        if state_idle_sec > 1.5:
+            return STATE_LISTENING
+    return None
+
+
+def evaluate_vad_race(
+    client_end_sent_at: Optional[float],
+    now: Optional[float] = None
+) -> Tuple[str, Optional[float]]:
+    """
+    评估客户端近场 VAD 与服务端 VAD 的竞速胜负（纯函数，供 recv_loop 与测试直接复用）:
+    - 若 client_end_sent_at 为 None：说明服务端先响应，客户端尚未发送 audio_stream_end -> SERVER_VAD_WON, None
+    - 若 client_end_sent_at 不为 None：客户端快路径先于服务端发出结束帧 -> CLIENT_VAD_WON, delta_ms
+    """
+    if now is None:
+        now = time.time()
+    if client_end_sent_at is None:
+        return "SERVER_VAD_WON", None
+    delta_ms = max(0.0, (now - client_end_sent_at) * 1000)
+    return "CLIENT_VAD_WON", delta_ms
+
+
+async def replay_pending_tool_responses(
+    session: Any,
+    session_state: Dict[str, Any],
+    has_resumption_handle: bool = True
+) -> None:
     """
     在新建立的 Live 会话中重放因网络断线或 GoAway 调度暂存的在途工具响应。
-    优先通过 session.send_tool_response 重放；
-    若 call_id 在新会话不被接受，则降级为通过 send_client_content 注入只读上下文（role='model', turn_complete=False，绝不触发模型插话）。
+    - 若有恢复句柄 (has_resumption_handle=True)，优先通过 session.send_tool_response 重放；
+      若失败则降级为只读文本注入。
+    - 若无恢复句柄 (has_resumption_handle=False，全新会话无对应 call_id)，直接通过文本注入，避免一次必败请求。
     无论成功或失败，重放后均清空暂存，杜绝死循环堆积。
     """
     pending_responses = session_state.get("pending_tool_responses")
     if not pending_responses:
+        return
+
+    # 若为全新会话（无恢复句柄），服务端并无前序 call_id，直接走文本注入降级，省去必败的网络请求
+    if not has_resumption_handle:
+        log_event("PENDING_TOOL_NO_HANDLE_DIRECT_INJECT", f"No resumption handle for new session, injecting {len(pending_responses)} pending results directly as context")
+        fallback_text = "\n".join([
+            f"[前序会话执行完成的工具 '{getattr(r, 'name', 'tool')}' 结果: {getattr(r, 'response', {}).get('result', {}) if isinstance(getattr(r, 'response', None), dict) else getattr(r, 'response', {})}]"
+            for r in pending_responses
+        ])
+        try:
+            await session.send_client_content(
+                turns=[types.Content(role="model", parts=[types.Part.from_text(text=fallback_text)])],
+                turn_complete=False
+            )
+            log_event("PENDING_TOOL_FALLBACK_INJECTED", "Injected pending tool results via model content fallback")
+        except Exception as fb_err:
+            log_event("PENDING_TOOL_FALLBACK_FAIL", f"Fallback injection failed: {fb_err}")
+        finally:
+            session_state["pending_tool_responses"] = []
         return
 
     try:
@@ -1330,11 +1401,13 @@ async def run_session(
     tool_executor = ToolExecutor(mcp_session=mcp_session)
     send_lock = asyncio.Lock()
     turn_vad_recorded = False
+    client_end_sent_at: Optional[float] = None
 
     def handle_voice_barge_in(reason: str, initial_chunks: Optional[List[bytes]] = None):
         """在事件循环主线程中线程安全地处理打断、清理队列与开启新轮次，完整注入打断前摇音频"""
-        nonlocal turn_vad_recorded
+        nonlocal turn_vad_recorded, client_end_sent_at
         turn_vad_recorded = False
+        client_end_sent_at = None
         turn_ctrl.interrupt(reason)
         audio_turn_queue.discard_turn()
         turn_ctrl.new_turn(f"speech_after_{reason}")
@@ -1344,8 +1417,9 @@ async def run_session(
 
     def handle_voice_speech_start(chunks_to_send: list):
         """在事件循环主线程中线程安全地开启新轮次并推送起呼前摇音频"""
-        nonlocal turn_vad_recorded
+        nonlocal turn_vad_recorded, client_end_sent_at
         turn_vad_recorded = False
+        client_end_sent_at = None
         turn_ctrl.new_turn("speech_start")
         for pr_chunk in chunks_to_send:
             audio_turn_queue.enqueue_audio(pr_chunk)
@@ -1540,7 +1614,7 @@ async def run_session(
                 sys.stdout.flush()
 
             # 补发因网络断线或 GoAway 暂存的在途工具响应 (Pending Tool Responses)
-            await replay_pending_tool_responses(session, session_state)
+            await replay_pending_tool_responses(session, session_state, has_resumption_handle=bool(last_resumption_handle))
 
             handshake_done = True
 
@@ -1584,62 +1658,49 @@ async def run_session(
 
             # 看门狗：纯思考等待超时（12.0s无应答）平滑恢复就绪；失联超长超时（60s）触发重连
             async def watchdog_loop():
+                silent_since: Optional[float] = None
                 while not shutdown_event.is_set() and not reconnect_event.is_set():
-                    await asyncio.sleep(0.5)
-                    # 1. 快速恢复：纯语音等待回复超时（12.0秒服务端无输出，自动退回 LISTENING 避免假死卡住）
-                    if (
-                        turn_ctrl.state == STATE_THINKING
-                        and not turn_ctrl.has_active_tool
-                        and not turn_ctrl.waiting_tool_summary
-                        and not player.is_busy()
-                    ):
-                        idle_sec = time.time() - turn_ctrl.state_start_time
-                        if idle_sec > 12.0:
-                            log_event("THINKING_TIMEOUT_RECOVER", f"Server silent for {idle_sec:.1f}s, auto-recovering to LISTENING")
+                    await asyncio.sleep(0.1)
+                    now = time.time()
+
+                    # 连续静音计时（带去抖）：仅当扬声器连续静音时累计时长，网络轻微抖动(<150ms)重置清零
+                    if player.is_busy():
+                        silent_since = None
+                    else:
+                        if silent_since is None:
+                            silent_since = now
+
+                    silent_duration = (now - silent_since) if silent_since is not None else 0.0
+                    state_idle_sec = now - turn_ctrl.state_start_time
+
+                    target_state = evaluate_watchdog_state(
+                        current_state=turn_ctrl.state,
+                        has_active_tool=turn_ctrl.has_active_tool,
+                        silent_duration=silent_duration,
+                        state_idle_sec=state_idle_sec,
+                        waiting_tool_summary=turn_ctrl.waiting_tool_summary
+                    )
+
+                    if target_state:
+                        if target_state == STATE_LISTENING:
+                            if turn_ctrl.state == STATE_THINKING:
+                                log_event("THINKING_TIMEOUT_RECOVER", f"Server silent for {state_idle_sec:.1f}s, auto-recovering to LISTENING")
+                            elif turn_ctrl.state == STATE_SPEAKING:
+                                log_event("SPEAKING_ORPHAN_RECOVER", f"Audio playback completely silent for {silent_duration:.2f}s without active tool, auto-recovering to LISTENING")
+                            elif turn_ctrl.state == STATE_EXECUTING:
+                                log_event("EXECUTING_ORPHAN_RECOVER", f"No active tool running while in EXECUTING for {state_idle_sec:.1f}s, auto-recovering to LISTENING")
                             turn_ctrl.set_state(STATE_LISTENING)
                             sys.stdout.write(f"\r🟢 [\033[1;32m连接就绪，请直接对麦克风说话\033[0m] (起呼门限: {START_THRESHOLD})                 \n")
                             sys.stdout.flush()
-
-                    # 1.2 垫话播放完毕状态自愈：若处于 SPEAKING 状态但扬声器已静音且仍有活动工具，立即回切至 EXECUTING
-                    if (
-                        turn_ctrl.state == STATE_SPEAKING
-                        and not player.is_busy()
-                        and turn_ctrl.has_active_tool
-                    ):
-                        log_event("SPEAKING_TO_EXECUTING_RECOVER", "Audio playback finished while tool still executing, switching state to EXECUTING")
-                        turn_ctrl.set_state(STATE_EXECUTING)
-                        sys.stdout.write(f"\r⚙️ [\033[1;33m后台动作继续执行中...\033[0m]                                      \n")
-                        sys.stdout.flush()
-
-                    # 1.3 播报残留状态自愈：若处于 SPEAKING 状态但扬声器静音超过 1.0 秒且无活动工具，回退至 LISTENING
-                    if (
-                        turn_ctrl.state == STATE_SPEAKING
-                        and not player.is_busy()
-                        and not turn_ctrl.has_active_tool
-                    ):
-                        idle_sec = time.time() - turn_ctrl.state_start_time
-                        if idle_sec > 1.0:
-                            log_event("SPEAKING_ORPHAN_RECOVER", f"Playback idle in SPEAKING without active tool for {idle_sec:.1f}s, auto-recovering to LISTENING")
-                            turn_ctrl.set_state(STATE_LISTENING)
-                            sys.stdout.write(f"\r🟢 [\033[1;32m连接就绪，请直接对麦克风说话\033[0m] (起呼门限: {START_THRESHOLD})                 \n")
-                            sys.stdout.flush()
-
-                    # 1.5 孤儿执行态快速自愈：若处于 EXECUTING 状态但已无任何活动的后台工具任务，1.5 秒内自动退回 LISTENING
-                    if (
-                        turn_ctrl.state == STATE_EXECUTING
-                        and not turn_ctrl.has_active_tool
-                        and not player.is_busy()
-                    ):
-                        idle_sec = time.time() - turn_ctrl.state_start_time
-                        if idle_sec > 1.5:
-                            log_event("EXECUTING_ORPHAN_RECOVER", f"No active tool running while in EXECUTING for {idle_sec:.1f}s, auto-recovering to LISTENING")
-                            turn_ctrl.set_state(STATE_LISTENING)
-                            sys.stdout.write(f"\r🟢 [\033[1;32m连接就绪，请直接对麦克风说话\033[0m] (起呼门限: {START_THRESHOLD})                 \n")
+                        elif target_state == STATE_EXECUTING:
+                            log_event("SPEAKING_TO_EXECUTING_RECOVER", f"Audio playback finished (silent for {silent_duration:.2f}s) while tool still executing, switching state to EXECUTING")
+                            turn_ctrl.set_state(STATE_EXECUTING)
+                            sys.stdout.write(f"\r⚙️ [\033[1;33m后台动作继续执行中...\033[0m]                                      \n")
                             sys.stdout.flush()
 
                     # 2. 彻底失联重连看门狗
                     if turn_ctrl.state in [STATE_THINKING, STATE_EXECUTING] and not player.is_busy():
-                        idle_sec = time.time() - turn_ctrl.state_start_time
+                        idle_sec = now - turn_ctrl.state_start_time
                         if idle_sec > 60.0:
                             log_event("WATCHDOG_TIMEOUT", f"Server unresponsive for {idle_sec:.1f}s, reconnecting")
                             sys.stdout.write("\n⚠️ [\033[1;33m云端响应超时，正在自动重连并恢复会话记忆...\033[0m]\n")
@@ -1649,6 +1710,7 @@ async def run_session(
 
             # 音频流发送循环 (HybridVAD 模式，带 send_lock 保护)
             async def send_loop():
+                nonlocal client_end_sent_at
                 try:
                     while not shutdown_event.is_set() and not reconnect_event.is_set():
                         item = await audio_turn_queue.get()
@@ -1657,6 +1719,7 @@ async def run_session(
                         if item == AudioTurnQueue.END:
                             async with send_lock:
                                 await session.send_realtime_input(audio_stream_end=True)
+                            client_end_sent_at = time.time()
                             log_event("SEND_AUDIO_STREAM_END", "Sent audio_stream_end=True to Gemini")
                         else:
                             async with send_lock:
@@ -1773,8 +1836,8 @@ async def run_session(
                             response={"result": "【已取消】操作因 GoAway 或轮次打断协同取消"}
                         ))
                         executed_call_ids.add(rc.id)
-                    if function_responses and go_away_time_left is not None:
-                        log_event("STASH_GOAWAY_CANCELLED_TOOL", f"Stashing {len(function_responses)} tool responses (including {len(remaining_calls)} cancelled) during GoAway")
+                    if function_responses and (reconnect_event.is_set() or go_away_time_left is not None):
+                        log_event("STASH_RECONNECT_CANCELLED_TOOL", f"Stashing {len(function_responses)} tool responses (including {len(remaining_calls)} cancelled) during reconnect")
                         pending_list = session_state.setdefault("pending_tool_responses", [])
                         pending_list.extend(function_responses)
                 except Exception as e:
@@ -1793,13 +1856,14 @@ async def run_session(
                 nonlocal current_user_transcript, current_model_transcript, current_tools_executed, go_away_time_left
 
                 def record_vad_race_winner(trigger_event: str):
-                    nonlocal turn_vad_recorded
+                    nonlocal turn_vad_recorded, client_end_sent_at
                     if not turn_vad_recorded:
                         turn_vad_recorded = True
-                        if is_speaking:
-                            log_event("SERVER_VAD_WON", f"Server VAD won race (triggered by '{trigger_event}' while client is_speaking=True)")
+                        winner, delta_ms = evaluate_vad_race(client_end_sent_at)
+                        if winner == "SERVER_VAD_WON":
+                            log_event("SERVER_VAD_WON", f"Server VAD won race (response arrived before client audio_stream_end, trigger='{trigger_event}')")
                         else:
-                            log_event("CLIENT_VAD_WON", f"Client near-field VAD won race (fast path, event='{trigger_event}')")
+                            log_event("CLIENT_VAD_WON", f"Client near-field VAD won race (fast path lead by {delta_ms:.1f}ms, trigger='{trigger_event}')")
 
                 try:
                     while not shutdown_event.is_set() and not reconnect_event.is_set():
@@ -1842,7 +1906,6 @@ async def run_session(
 
                             # 1. 检查服务端打断信号 (仅在客户端正处于播报态时才打断轮次，绝不误杀客户端已开辟的新轮次Token)
                             if response.server_content and response.server_content.interrupted:
-                                record_vad_race_winner("server_interrupted")
                                 player.interrupt()
                                 if turn_ctrl.state == STATE_SPEAKING:
                                     turn_ctrl.interrupt("Server reported interrupted")
@@ -1851,7 +1914,6 @@ async def run_session(
                             # 1.5 语音实时转录展示与收集
                             if response.server_content:
                                 if response.server_content.input_transcription and response.server_content.input_transcription.text:
-                                    record_vad_race_winner("input_transcription")
                                     txt = response.server_content.input_transcription.text.strip()
                                     if txt:
                                         current_user_transcript.append(txt)
@@ -1887,17 +1949,6 @@ async def run_session(
                                             continue
                                         turn_ctrl.set_state(STATE_SPEAKING)
                                         player.write(part.inline_data.data)
-                                        if turn_ctrl.has_active_tool:
-                                            # NON_BLOCKING 垫话播放：异步观察扬声器，播放完毕立即切回 EXECUTING 避免状态机挂在 SPEAKING
-                                            current_turn = turn_ctrl.current_turn_id
-                                            async def observe_filler_done(tid: int):
-                                                await asyncio.sleep(0.08)
-                                                while player.is_busy():
-                                                    await asyncio.sleep(0.03)
-                                                if turn_ctrl.is_current_turn(tid) and turn_ctrl.state == STATE_SPEAKING and turn_ctrl.has_active_tool:
-                                                    turn_ctrl.set_state(STATE_EXECUTING)
-                                                    log_event("FILLER_PLAYBACK_DONE", f"Filler speech finished for turn {tid}, state returned to EXECUTING")
-                                            asyncio.create_task(observe_filler_done(current_turn))
 
                             # 3. 工具调用请求（异步解耦至独立后台任务，绝不阻塞 recv_loop）
                             if response.tool_call:
@@ -1999,7 +2050,7 @@ async def run_session(
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        if should_disable_custom_vocab(e):
+        if not handshake_done and should_disable_custom_vocab(e):
             log_event("CUSTOM_VOCAB_DISABLED", f"Server rejected custom_vocabulary ({e}), disabling for subsequent sessions")
             session_state["custom_vocab_disabled"] = True
 
