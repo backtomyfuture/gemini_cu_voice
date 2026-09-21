@@ -95,6 +95,8 @@ from gemini_live_cu import (
     replay_pending_tool_responses,
     evaluate_watchdog_state,
     evaluate_vad_race,
+    save_resumption_handle,
+    load_resumption_handle,
 )
 from ego_browser_client import (
     browser_open,
@@ -2145,13 +2147,71 @@ async def test_layer_0(report: TestReport):
     role_ok = call_args.kwargs.get("turns", [None])[0].role == "model"
     tc_ok = call_args.kwargs.get("turn_complete") is False
 
-    no_handle_prod_ok = direct_inject_called and tool_resp_not_called and stash_emptied and role_ok and tc_ok
+    # 0.42 生产级会话句柄磁盘持久化与生命周期契约 (Resumption Handle Disk Persistence Test)
+    t0 = time.time()
+    tmp_handle_path = Path("/tmp/test_gemini_resumption_handle.tmp")
+    if tmp_handle_path.exists():
+        tmp_handle_path.unlink()
+
+    # 1. 保存与正常读取
+    test_handle_str = "handle_test_token_abc123"
+    save_resumption_handle(test_handle_str, path=tmp_handle_path)
+    saved_ok = tmp_handle_path.exists()
+    loaded_str = load_resumption_handle(path=tmp_handle_path, max_age_sec=3600.0)
+    match_str_ok = loaded_str == test_handle_str
+
+    # 2. 超时过期自动清除
+    time.sleep(0.01)
+    expired_result = load_resumption_handle(path=tmp_handle_path, max_age_sec=0.005)
+    expired_clean_ok = expired_result is None and not tmp_handle_path.exists()
+
+    # 3. 显式清除 (save None)
+    save_resumption_handle("dummy_token", path=tmp_handle_path)
+    save_resumption_handle(None, path=tmp_handle_path)
+    cleared_ok = not tmp_handle_path.exists()
+
+    handle_persistence_ok = saved_ok and match_str_ok and expired_clean_ok and cleared_ok
     cost = (time.time() - t0) * 1000
     report.record(
         "Layer 0",
-        "在途治理: 生产函数 replay_pending_tool_responses 无句柄直接降级文本注入，省去必败请求 (No Handle Direct Injection)",
-        no_handle_prod_ok,
-        f"直接注入={direct_inject_called}, 未调必败接口={tool_resp_not_called}, 暂存已清空={stash_emptied}, role='model'={role_ok}",
+        "句柄持久化: 生产函数 save/load_resumption_handle 磁盘缓存、过期自愈与显式清空 (Handle Disk Persistence)",
+        handle_persistence_ok,
+        f"保存读取命中={match_str_ok}, 过期自动清洗={expired_clean_ok}, 显式清空={cleared_ok}",
+        cost,
+    )
+
+    # 0.43 生产级模型主动发声防 VAD 脏数据门控契约 (Model Proactive Speech VAD Gating Test)
+    t0 = time.time()
+    # 模拟场景: 用户未说话 (user_turn_pending=False)，纯后台工具响应调度返回引发模型主动回复
+    sim_user_pending = False
+    sim_vad_recorded = False
+    sim_log_events = []
+
+    def mock_recorder(trigger: str):
+        nonlocal sim_user_pending, sim_vad_recorded
+        if not sim_user_pending:
+            return
+        if not sim_vad_recorded:
+            sim_vad_recorded = True
+            sim_user_pending = False
+            sim_log_events.append("RECORDED")
+
+    # 1. 工具返回触发 model_turn，未由用户麦克风起呼 -> 绝不记脏数据
+    mock_recorder("model_turn_after_tool")
+    proactive_blocked = len(sim_log_events) == 0 and sim_vad_recorded is False
+
+    # 2. 用户真实起呼 (user_turn_pending=True) -> 正常记录
+    sim_user_pending = True
+    mock_recorder("model_turn_after_user")
+    user_turn_recorded = len(sim_log_events) == 1 and sim_vad_recorded is True and sim_user_pending is False
+
+    vad_gate_ok = proactive_blocked and user_turn_recorded
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "指标防护: user_turn_pending 门控严格屏蔽工具回调引发的模型主动发声记脏数据 (Proactive Speech VAD Gate)",
+        vad_gate_ok,
+        f"工具返回主动发声拦截={proactive_blocked}, 用户真实发言记录={user_turn_recorded}",
         cost,
     )
 

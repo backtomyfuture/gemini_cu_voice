@@ -72,7 +72,7 @@ uv run --locked python gemini_live_cu.py
 本项目配备了工业级多层级自动化测试套件 `test_suite.py`，**支持使用真实的 16kHz 16-bit PCM 语音数据直接传递给 Gemini 驱动执行，拒绝单一脚本文本触发，并实现所有应用全流程深度交互闭环**。
 
 ### 测试架构三层分级：
-- **Layer 0：安全执行策略与治理规则单元测试** (42 项测试全部通过)
+- **Layer 0：安全执行策略与治理规则单元测试** (43 项测试全部通过)
   - 覆盖只读放行、高危按键阻断、Prompt 注入防御、打断令牌流控、单轮预算上限、重复调用抑制、浏览器子进程超时强杀与幽灵数据阻断等。
 - **Layer 1：硬件音频与近场 VAD 门控健康检查** (原 Layer 3 提前)
   - 检查麦克风识别、双声道/单声道采集、底噪 RMS、自适应起呼门限与维持门限健康度。
@@ -89,7 +89,7 @@ uv run --locked python gemini_live_cu.py
 uv run python test_suite.py
 
 # 2. 仅运行指定层级测试
-uv run python test_suite.py --layer 0    # 极速安全策略单测 (42项)
+uv run python test_suite.py --layer 0    # 极速安全策略单测 (43项)
 uv run python test_suite.py --layer 1    # 硬件麦克风识别与自适应 VAD 门控健康度检查
 uv run python test_suite.py --layer 2    # 真实 PCM 语音驱动全链路应用深度闭环评测 (gemini-3.8-live)
 

@@ -684,6 +684,14 @@ def evaluate_watchdog_state(
     - STATE_SPEAKING 且无活动工具且连续静音 >= 1.0s -> STATE_LISTENING (无 turn_complete 播报残留兜底)
     - STATE_EXECUTING 且无活动工具，持续 1.5s -> STATE_LISTENING (孤儿执行态快速自愈)
     - 其余情况维持原状态（返回 None）
+
+    【底层物理延迟叠加说明】：
+    SmoothAudioPlayer.is_busy() 依赖底层 queue.get(timeout=0.15) 判定队列排空，因此当播放结束时，
+    is_busy 变 False 天然带有约 150ms 的尾随延时。
+    故实际物理感知延迟为：
+      - 垫话切回 EXECUTING: ~0.15s (播放器排空) + 0.30s (连续静音) = ~0.45s 物理延迟；
+      - 播报残留兜底 LISTENING: ~0.15s (播放器排空) + 1.00s (连续静音) = ~1.15s 物理延迟。
+    该设计有效吸收了声卡驱动缓冲区抖动与轻度网络卡顿，请勿随意将此处门限与播放器超时脱钩。
     """
     if current_state == STATE_THINKING and not has_active_tool and not waiting_tool_summary:
         if state_idle_sec > 12.0:
@@ -698,6 +706,41 @@ def evaluate_watchdog_state(
         if state_idle_sec > 1.5:
             return STATE_LISTENING
     return None
+
+
+RESUMPTION_HANDLE_FILE = CUR_DIR / ".resumption_handle"
+
+
+def save_resumption_handle(handle: Optional[str], path: Optional[Path] = None) -> None:
+    """持久化官方 Session Resumption Handle 至磁盘；若 handle 为 None 则清除文件"""
+    target = path or RESUMPTION_HANDLE_FILE
+    try:
+        if handle and str(handle).strip():
+            target.write_text(str(handle).strip(), encoding="utf-8")
+        else:
+            if target.exists():
+                target.unlink(missing_ok=True)
+    except Exception as e:
+        log_event("SAVE_HANDLE_FAIL", f"Failed to save resumption handle to {target}: {e}")
+
+
+def load_resumption_handle(path: Optional[Path] = None, max_age_sec: float = 7200.0) -> Optional[str]:
+    """从磁盘加载上次保留的 Session Resumption Handle；若文件过期或不存在则返回 None"""
+    target = path or RESUMPTION_HANDLE_FILE
+    try:
+        if not target.exists():
+            return None
+        # 句柄有效期检查（默认不超过 2 小时，Google Live API 句柄寿命有限）
+        file_age = time.time() - target.stat().st_mtime
+        if file_age > max_age_sec:
+            log_event("HANDLE_EXPIRED_ON_DISK", f"Persisted handle expired (age={file_age:.0f}s > {max_age_sec}s), purging")
+            target.unlink(missing_ok=True)
+            return None
+        content = target.read_text(encoding="utf-8").strip()
+        return content if content else None
+    except Exception as e:
+        log_event("LOAD_HANDLE_FAIL", f"Failed to load resumption handle from {target}: {e}")
+        return None
 
 
 def evaluate_vad_race(
@@ -1058,19 +1101,12 @@ SYSTEM_INSTRUCTION = """
 3. 无论用户当前使用什么语言输入、无论网页和工具返回什么语言，你的口语回复、思考总结、状态反馈必须全部使用纯正自然的中文！
 
 【普通话语音识别对齐与领域纠错规则（CRITICAL FOR SPEECH RECOGNITION）】：
-1. 用户输入为中文普通话实时语音流。在声学与语义解码时，必须强制结合科技、macOS 桌面操作与互联网资讯语境进行纠偏，绝对严禁出现跨语言幻觉（严禁输出印地语、梵文、法语、西班牙语等无关外语）！
-2. 常见易混淆科技、桌面专有名词与日常口语严格对照表（结合发音、声调与上下文精准对齐）：
-   - “我让你帮我搜” / “让你帮我搜” / “请帮我搜”（绝对不可误听或脑补为“玩你帮我搜”！）。
-   - “打开了吗” / “打开了么”（绝对不可误听为“打卡吗”或“考勤打卡”！）。
-   - “十月一号” / “10月1号”（绝对不可丢失开头“十”或“10”而误听为“是一号”！）。
-   - “长鑫科技” / “长信科技” / “长江存储” / “中芯国际” 等半导体与科技公司（发音常有送气音 ch/zh，绝对不可误听或脑补为“朱朝阳日记”、“朝阳日记”等非科技词汇！）。
-   - “浏览器”（Ego Lite 浏览器、Safari、Chrome 等，发音为 liú lǎn qì，绝对不可误听为“暖气”！）。
-   - “IT之家”（中国知名科技数码资讯网站 ithome.com，发音为 IT zhī jiā，绝对不可误听为“IT职教”或其它学校！）。
-   - “计算器”（发音 jì suàn qì，不可误听为“光盘录”或“计时器”）。
-   - “Discord”（流行通讯软件，不可误听为“disc code”）。
-   - “Outlook” / “邮箱” / “邮件”。
-   - “模型” / “大模型” / “AI模型”（发音 mó xíng，绝对不可误听为“魔鬼”！）。
-3. 遇到发音微弱、送气音轻或同音字时，强制结合当前桌面操作上下文推断为用户真实意图或桌面软件名称。
+1. 用户输入为中文普通话实时流式语音。请强制结合 macOS 桌面操作、常见桌面应用与科技互联网资讯语境进行声学语义纠偏，杜绝跨语言幻觉；
+2. 核心科技、桌面名词与日常高频指令映射（结合发音与上下文精准对齐）：
+   - 科技与资讯公司：“长鑫科技”、“长江存储”、“中芯国际”、“IT之家 (ithome.com)”、“大模型/AI模型”；
+   - 常见软件与工具：“浏览器/Ego Lite”、“计算器”、“备忘录”、“Outlook/邮箱”、“Discord”、“微信/QQ”；
+   - 高频口语指令：“帮我搜/请帮我搜”、“打开了吗/打开了么”、“10月1号/十月一号”；
+3. 遇到轻音、弱读或近音字时，强制根据当前屏幕活动窗口与上下文推断用户的真实操作意图。
 
 【核心身份与上下文记忆原则】：
 1. 你具备跨轮次的上下文记忆能力！你能够清晰记住用户在前面各轮说过的指令、参数、偏好以及上一步打开的应用与网页。
@@ -1320,7 +1356,9 @@ async def run_session(
         else types.SessionResumptionConfig()
     )
     target_tokens = int(os.environ.get("CONTEXT_TARGET_TOKENS", 32000))
+    trigger_tokens = int(os.environ.get("CONTEXT_TRIGGER_TOKENS", 100000))
     context_compression_cfg = types.ContextWindowCompressionConfig(
+        trigger_tokens=trigger_tokens,
         sliding_window=types.SlidingWindow(target_tokens=target_tokens)
     )
 
@@ -1402,12 +1440,14 @@ async def run_session(
     send_lock = asyncio.Lock()
     turn_vad_recorded = False
     client_end_sent_at: Optional[float] = None
+    user_turn_pending: bool = False
 
     def handle_voice_barge_in(reason: str, initial_chunks: Optional[List[bytes]] = None):
         """在事件循环主线程中线程安全地处理打断、清理队列与开启新轮次，完整注入打断前摇音频"""
-        nonlocal turn_vad_recorded, client_end_sent_at
+        nonlocal turn_vad_recorded, client_end_sent_at, user_turn_pending
         turn_vad_recorded = False
         client_end_sent_at = None
+        user_turn_pending = True
         turn_ctrl.interrupt(reason)
         audio_turn_queue.discard_turn()
         turn_ctrl.new_turn(f"speech_after_{reason}")
@@ -1417,9 +1457,10 @@ async def run_session(
 
     def handle_voice_speech_start(chunks_to_send: list):
         """在事件循环主线程中线程安全地开启新轮次并推送起呼前摇音频"""
-        nonlocal turn_vad_recorded, client_end_sent_at
+        nonlocal turn_vad_recorded, client_end_sent_at, user_turn_pending
         turn_vad_recorded = False
         client_end_sent_at = None
+        user_turn_pending = True
         turn_ctrl.new_turn("speech_start")
         for pr_chunk in chunks_to_send:
             audio_turn_queue.enqueue_audio(pr_chunk)
@@ -1856,9 +1897,13 @@ async def run_session(
                 nonlocal current_user_transcript, current_model_transcript, current_tools_executed, go_away_time_left
 
                 def record_vad_race_winner(trigger_event: str):
-                    nonlocal turn_vad_recorded, client_end_sent_at
+                    nonlocal turn_vad_recorded, client_end_sent_at, user_turn_pending
+                    # 关键防脏数据门控：若本轮未发生过用户真实语音起呼（如 NON_BLOCKING 工具结果返回引发模型主动回复），绝不记录 VAD 竞速
+                    if not user_turn_pending:
+                        return
                     if not turn_vad_recorded:
                         turn_vad_recorded = True
+                        user_turn_pending = False
                         winner, delta_ms = evaluate_vad_race(client_end_sent_at)
                         if winner == "SERVER_VAD_WON":
                             log_event("SERVER_VAD_WON", f"Server VAD won race (response arrived before client audio_stream_end, trigger='{trigger_event}')")
@@ -1879,6 +1924,7 @@ async def run_session(
                                 upd = response.session_resumption_update
                                 if upd.resumable and upd.new_handle:
                                     session_state["handle"] = upd.new_handle
+                                    save_resumption_handle(upd.new_handle)
                                     log_event("RESUMPTION_HANDLE", f"Updated resumption handle: {upd.new_handle[:16]}...")
 
                             # 0.1 检查服务端 GoAway 通知 (平滑重连)
@@ -1977,6 +2023,8 @@ async def run_session(
                                     current_model_transcript = []
                                     current_tools_executed = []
                                     turn_vad_recorded = False
+                                    client_end_sent_at = None
+                                    user_turn_pending = False
 
                                     completed_turn_id = turn_ctrl.current_turn_id
 
@@ -2182,7 +2230,12 @@ async def main():
                 print(f"[3/3] 🟢 实时语音管家已就绪！")
                 print(f"💡 对着 \033[1;32m{mic_name}\033[0m 说话即可全双工实时交互。按 Ctrl+C 退出。\n" + "-" * 68)
 
-                session_state = {"handle": None}
+                initial_handle = load_resumption_handle()
+                session_state = {"handle": initial_handle}
+                if initial_handle:
+                    log_event("HANDLE_LOADED_FROM_DISK", f"Loaded persisted handle from disk: {initial_handle[:16]}...")
+                    print(f"⚡ [检测到磁盘缓存的会话句柄 ({initial_handle[:12]}...)，尝试无缝恢复会话记忆...]")
+
                 retry_count = 0
                 while not shutdown_event.is_set():
                     try:
@@ -2218,6 +2271,7 @@ async def main():
                         log_event("RESUME_FAILED_FALLBACK", f"Session resume with handle failed: {e}. Clearing handle and falling back to memory injection.")
                         print("\n⚠️ [官方会话句柄已失效，自动清空 Handle 并降级为本地上下文记忆回灌...]", file=sys.stderr)
                         session_state["handle"] = None
+                        save_resumption_handle(None)
                         await asyncio.sleep(0.5)
                     except Exception as e:
                         retry_count += 1
