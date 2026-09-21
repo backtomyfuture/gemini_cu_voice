@@ -71,7 +71,13 @@ from gemini_live_cu import (
     SYSTEM_INSTRUCTION,
     ConversationMemory,
     TurnController,
-    ResumptionHandleExpiredError
+    ResumptionHandleExpiredError,
+    run_session,
+    AudioTurnQueue,
+    ToolExecutor,
+    STATE_LISTENING,
+    STATE_THINKING,
+    STATE_SPEAKING,
 )
 from ego_browser_client import (
     browser_open,
@@ -966,6 +972,351 @@ async def test_layer_0(report: TestReport):
         "恢复语义: GoAway保留最新恢复句柄，仅建连握手失败时降级清空 (Resumption Semantics Isolation)",
         resumption_isolation_ok,
         f"GoAway保留Handle={goaway_preserved}, 握手失败清空Handle={handshake_fallback_ok}",
+        cost,
+    )
+
+    # 0.21 连接寿命: send/recv 必须在 Live connect context 内启动，context 只在任务清理后退出
+    t0 = time.time()
+
+    class FakeGoAway:
+        pass
+
+    class FakeLiveResponse:
+        def __init__(self):
+            self.session_resumption_update = None
+            self.go_away = FakeGoAway()
+            self.tool_call_cancellation = None
+            self.server_content = None
+            self.tool_call = None
+
+    class FakeLiveSession:
+        def __init__(self):
+            self.closed = True
+            self.receive_started_while_open = False
+            self.send_realtime_while_open = False
+            self.used_after_close = False
+
+        async def send_client_content(self, **kwargs):
+            if self.closed:
+                self.used_after_close = True
+                raise RuntimeError("Live session used after context exit")
+
+        async def send_realtime_input(self, **kwargs):
+            if self.closed:
+                self.used_after_close = True
+                raise RuntimeError("Live session used after context exit")
+            self.send_realtime_while_open = True
+
+        async def send_tool_response(self, **kwargs):
+            if self.closed:
+                self.used_after_close = True
+                raise RuntimeError("Live session used after context exit")
+
+        async def receive(self):
+            if self.closed:
+                self.used_after_close = True
+                raise RuntimeError("Live session used after context exit")
+            self.receive_started_while_open = True
+            yield FakeLiveResponse()
+            await asyncio.Event().wait()
+
+    class FakeLiveConnect:
+        def __init__(self, session):
+            self.session = session
+            self.entered = False
+            self.exited = False
+            self.exited_before_receive = False
+
+        async def __aenter__(self):
+            self.entered = True
+            self.session.closed = False
+            return self.session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            self.exited_before_receive = not self.session.receive_started_while_open
+            self.session.closed = True
+            self.exited = True
+            return False
+
+    class FakeLive:
+        def __init__(self, connect_cm):
+            self._connect_cm = connect_cm
+
+        def connect(self, **kwargs):
+            return self._connect_cm
+
+    class FakeAio:
+        def __init__(self, connect_cm):
+            self.live = FakeLive(connect_cm)
+
+    class FakeClient:
+        def __init__(self, connect_cm):
+            self.aio = FakeAio(connect_cm)
+
+    class FakeMicStream:
+        def __init__(self, **kwargs):
+            self.started = False
+            self.stopped = False
+            self.closed = False
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            self.stopped = True
+
+        def close(self):
+            self.closed = True
+
+    class DummyPlayer:
+        def is_busy(self):
+            return False
+
+        def interrupt(self):
+            return None
+
+        def write(self, data):
+            return None
+
+        def stop(self):
+            return None
+
+    fake_session = FakeLiveSession()
+    fake_connect = FakeLiveConnect(fake_session)
+    original_sleep = asyncio.sleep
+
+    async def fast_sleep(delay, *args, **kwargs):
+        await original_sleep(0 if delay >= 1.0 else delay)
+
+    shutdown_event = asyncio.Event()
+    lifetime_ok = False
+    try:
+        with mock.patch("gemini_live_cu.genai.Client", return_value=FakeClient(fake_connect)), \
+             mock.patch("gemini_live_cu.sd.RawInputStream", FakeMicStream), \
+             mock.patch("gemini_live_cu.asyncio.sleep", fast_sleep):
+            try:
+                await asyncio.wait_for(
+                    run_session(
+                        api_key="test-key",
+                        selected_model="gemini-3.8-live",
+                        voice_name="Aoede",
+                        mic_idx=0,
+                        mic_name="Fake Mic",
+                        mic_channels=1,
+                        mcp_session=mock.Mock(),
+                        gemini_functions=[],
+                        player=DummyPlayer(),
+                        shutdown_event=shutdown_event,
+                        memory=ConversationMemory(max_turns=3),
+                        user_threshold=120,
+                        session_state={"handle": None},
+                    ),
+                    timeout=2.0,
+                )
+            except ConnectionError:
+                pass
+            except asyncio.TimeoutError:
+                shutdown_event.set()
+        lifetime_ok = (
+            fake_connect.entered
+            and fake_connect.exited
+            and fake_session.receive_started_while_open
+            and (not fake_connect.exited_before_receive)
+            and (not fake_session.used_after_close)
+        )
+    finally:
+        shutdown_event.set()
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "连接寿命: send/recv 在 Live connect context 内启动，清理后才退出 (Session Runtime Lifetime)",
+        lifetime_ok,
+        f"entered={fake_connect.entered}, exited={fake_connect.exited}, recv_while_open={fake_session.receive_started_while_open}, exited_before_recv={fake_connect.exited_before_receive}, used_after_close={fake_session.used_after_close}",
+        cost,
+    )
+
+    # 0.22 音频 turn 队列: PCM 溢出不可挤掉当前 turn 的结束信号
+    t0 = time.time()
+    audio_q = AudioTurnQueue(maxsize=3)
+    for i in range(3):
+        audio_q.enqueue_audio(bytes([i]))
+    audio_q.finish_turn()
+    for i in range(5):
+        audio_q.enqueue_audio(bytes([100 + i]))
+
+    drained = []
+    for _ in range(12):
+        try:
+            item = await asyncio.wait_for(audio_q.get(), timeout=0.02)
+        except asyncio.TimeoutError:
+            break
+        if item is None:
+            break
+        drained.append(item)
+
+    end_count = sum(1 for item in drained if item == AudioTurnQueue.END)
+    overflow_end_ok = end_count == 1
+
+    audio_q2 = AudioTurnQueue(maxsize=3)
+    audio_q2.enqueue_audio(b"old-pcm")
+    audio_q2.finish_turn()
+    audio_q2.discard_turn()
+    audio_q2.enqueue_audio(b"new-pcm")
+    after_discard = await asyncio.wait_for(audio_q2.get(), timeout=0.05)
+    discard_ok = after_discard == b"new-pcm"
+
+    audio_end_ok = overflow_end_ok and discard_ok
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "音频结束信号: PCM 溢出不挤掉 AUDIO_STREAM_END，打断清空当前 turn (Audio Turn End Isolation)",
+        audio_end_ok,
+        f"溢出后END次数={end_count}, 打断后首包={after_discard!r}",
+        cost,
+    )
+
+    # 0.23 轮次状态: TurnController 拥有 state，打断在事件循环侧恢复 LISTENING
+    t0 = time.time()
+    try:
+        ctrl_state = TurnController()
+        initial_ok = ctrl_state.state == STATE_LISTENING
+        ctrl_state.set_state(STATE_SPEAKING)
+        speaking_ok = ctrl_state.state == STATE_SPEAKING
+        loop = asyncio.get_running_loop()
+
+        def loop_owned_barge_in():
+            ctrl_state.interrupt("mic_barge_in")
+            ctrl_state.new_turn("speech_after_speaking")
+
+        loop.call_soon_threadsafe(loop_owned_barge_in)
+        await asyncio.sleep(0.02)
+        barge_ok = ctrl_state.state == STATE_LISTENING
+        ctrl_state.set_state(STATE_THINKING)
+        thinking_ok = ctrl_state.state == STATE_THINKING and ctrl_state.state_start_time > 0
+        turn_state_ok = initial_ok and speaking_ok and barge_ok and thinking_ok
+        detail = (
+            f"initial={initial_ok}, speaking={speaking_ok}, "
+            f"interrupt→LISTENING={barge_ok}, thinking={thinking_ok}"
+        )
+    except Exception as e:
+        turn_state_ok = False
+        detail = str(e)
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "轮次状态: TurnController 拥有 state，打断由事件循环恢复 LISTENING (Turn State Ownership)",
+        turn_state_ok,
+        detail,
+        cost,
+    )
+
+    # 0.24 Extended Thinking: 仅 interaction_status=IDLE 视为空闲；默认模型仍用 turn_complete
+    t0 = time.time()
+
+    class FakeServerContent:
+        def __init__(self, turn_complete=False, interaction_status=None):
+            self.turn_complete = turn_complete
+            self.interaction_status = interaction_status
+
+    class FakeResponse:
+        def __init__(self, turn_complete=False, interaction_status=None, top_status=None):
+            self.server_content = FakeServerContent(turn_complete, interaction_status)
+            self.interaction_status = top_status
+            self.tool_call = None
+
+    fast_ctrl = TurnController(use_interaction_status=False)
+    fast_idle = fast_ctrl.is_interaction_idle(FakeResponse(turn_complete=True))
+    fast_not_idle = not fast_ctrl.is_interaction_idle(FakeResponse(turn_complete=False))
+
+    think_ctrl = TurnController(use_interaction_status=True)
+    filler_not_idle = not think_ctrl.is_interaction_idle(
+        FakeResponse(turn_complete=True, interaction_status="IN_PROGRESS")
+    )
+    top_level_idle = think_ctrl.is_interaction_idle(
+        FakeResponse(turn_complete=True, top_status="IDLE")
+    )
+    nested_idle = think_ctrl.is_interaction_idle(
+        FakeResponse(turn_complete=True, interaction_status="IDLE")
+    )
+    missing_status_not_idle = not think_ctrl.is_interaction_idle(
+        FakeResponse(turn_complete=True)
+    )
+
+    thinking_idle_ok = (
+        fast_idle and fast_not_idle
+        and filler_not_idle and top_level_idle and nested_idle and missing_status_not_idle
+    )
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "思考空闲: Extended Thinking 以 interaction_status=IDLE 判定，默认模型仍用 turn_complete (Thinking Idle Gate)",
+        thinking_idle_ok,
+        f"fast_idle={fast_idle}, filler_blocked={filler_not_idle}, top_IDLE={top_level_idle}, nested_IDLE={nested_idle}, missing_blocked={missing_status_not_idle}",
+        cost,
+    )
+
+    # 0.25 工具执行 seam: 三个 adapter 都返回 ToolResultContract，不解析中文成功串
+    t0 = time.time()
+
+    class DummyMcpOk:
+        is_error = False
+        content = [type("Item", (), {"text": "AX window Microsoft Outlook"})]
+
+    class DummyMcpFail:
+        is_error = True
+        content = [type("Item", (), {"text": "Accessibility element [5] not found"})]
+
+    class DummyMcpSession:
+        def __init__(self):
+            self.calls = []
+
+        async def call_tool(self, name, args):
+            self.calls.append((name, args))
+            if name == "click" and args.get("fail"):
+                return DummyMcpFail()
+            return DummyMcpOk()
+
+    mcp = DummyMcpSession()
+    executor = ToolExecutor(mcp_session=mcp, launch_app=lambda name, bid="": f"成功打开并激活应用: {name}")
+
+    native = await executor.execute("open_app", {"name": "计算器"})
+    kimi_ok = await executor.execute("get_app_state", {"app": "com.microsoft.Outlook"})
+    kimi_fail = await executor.execute("click", {"index": 5, "fail": True})
+
+    with mock.patch("gemini_live_cu.browser_click", new=mock.AsyncMock(return_value="【失败】 点击失败: 未找到匹配元素")):
+        ego_fail = await executor.execute("browser_click", {"text": "不存在的按钮"})
+    with mock.patch("gemini_live_cu.browser_open", new=mock.AsyncMock(return_value="【页面标题】失败是常态\n【URL】https://ok.com")):
+        ego_ok = await executor.execute("browser_open", {"url": "https://ok.com"})
+
+    native_ok = native.ok and native.status == "success" and native.action == "open_app"
+    kimi_mapped = kimi_ok.ok and (not kimi_fail.ok) and kimi_fail.status == "error"
+    ego_mapped = (not ego_fail.ok) and ego_ok.ok and ego_ok.status == "success"
+    dispatch_ok = native_ok and kimi_mapped and ego_mapped
+
+    # 0.25b 同一 turn 的第二个 tool_call 登记为额外 in-flight，不覆盖第一个任务
+    ctrl_tools = TurnController()
+    ctrl_tools.new_turn("tool-batch")
+    first = asyncio.create_task(asyncio.sleep(1.0))
+    second = asyncio.create_task(asyncio.sleep(1.0))
+    ctrl_tools.register_tool_task(first)
+    ctrl_tools.register_tool_task(second)
+    tracked = list(ctrl_tools.active_tool_tasks)
+    both_tracked = first in tracked and second in tracked
+    ctrl_tools.interrupt("second-call")
+    for t in (first, second):
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+    inflight_ok = both_tracked and first.cancelled() and second.cancelled()
+
+    tool_seam_ok = dispatch_ok and inflight_ok
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "工具 seam: 三个 adapter 返回 ToolResultContract，同轮多个 tool_call 不覆盖 in-flight (Tool Adapter Contract)",
+        tool_seam_ok,
+        f"native={native_ok}, kimi={kimi_mapped}, ego={ego_mapped}, both_tracked={both_tracked}",
         cost,
     )
 

@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Any, Dict, List, Set, Union
+from typing import Optional, Any, Dict, List, Set, Union, Callable
 
 from dotenv import load_dotenv
 from google import genai
@@ -88,49 +88,175 @@ class ResumptionHandleExpiredError(ConnectionError):
     pass
 
 
+STATE_LISTENING = "LISTENING"  # 空闲听用户说话
+STATE_THINKING = "THINKING"    # 用户已说完，正在等待 Gemini 思考/下发动作
+STATE_EXECUTING = "EXECUTING"  # kimi-cu 工具正在物理执行中
+STATE_SPEAKING = "SPEAKING"    # 扬声器正在平滑播报中
+
+
 class TurnController:
-    """集中式轮次生命周期控制器，管理单调递增 turn_id、当前取消令牌、后台工具任务与播放结束隔离"""
-    def __init__(self):
+    """集中式轮次生命周期控制器，管理单调递增 turn_id、当前取消令牌、后台工具任务、播放结束隔离与会话状态"""
+    def __init__(self, use_interaction_status: bool = False):
         self.current_turn_id: int = 0
         self.cancellation_token: CancellationToken = CancellationToken("turn_0")
         self.active_tool_task: Optional[asyncio.Task] = None
+        self.active_tool_tasks: List[asyncio.Task] = []
         self.waiting_tool_summary: bool = False
         self.has_active_tool: bool = False
         self.is_interrupted: bool = False
+        self.state: str = STATE_LISTENING
+        self.state_start_time: float = time.time()
+        self.use_interaction_status = use_interaction_status
+
+    def set_state(self, new_state: str):
+        """唯一的会话状态迁移入口；状态与进入时刻都集中在此"""
+        if self.state != new_state:
+            self.state = new_state
+            self.state_start_time = time.time()
+            log_event("STATE", f"Transitioned to {new_state}")
 
     def new_turn(self, reason: str = "new_turn") -> int:
         """开启新轮次：递增 turn_id，生成全新有效 CancellationToken，取消可能残余的工具任务"""
         self.current_turn_id += 1
-        if self.active_tool_task and not self.active_tool_task.done():
-            self.active_tool_task.cancel()
-            self.active_tool_task = None
+        self._cancel_tool_tasks()
         self.cancellation_token = CancellationToken(f"turn_{self.current_turn_id}_{time.time():.3f}")
         self.has_active_tool = False
         self.waiting_tool_summary = False
         self.is_interrupted = False
         return self.current_turn_id
 
+    def _cancel_tool_tasks(self):
+        tasks = list(self.active_tool_tasks)
+        if self.active_tool_task and self.active_tool_task not in tasks:
+            tasks.append(self.active_tool_task)
+        for task in tasks:
+            if task and not task.done():
+                task.cancel()
+        self.active_tool_tasks.clear()
+        self.active_tool_task = None
+
+    def register_tool_task(self, task: asyncio.Task):
+        """登记同轮多个 in-flight 工具任务，后一次调用不覆盖前一次。"""
+        self.has_active_tool = True
+        self.active_tool_task = task
+        if task not in self.active_tool_tasks:
+            self.active_tool_tasks.append(task)
+
     def interrupt(self, reason: str = "interrupted"):
-        """处理打断：取消当前 Token 与工具任务，重置状态标记"""
+        """处理打断：取消当前 Token 与工具任务，重置状态标记并回到 LISTENING"""
         self.is_interrupted = True
         self.cancellation_token.cancel(reason)
-        if self.active_tool_task and not self.active_tool_task.done():
-            self.active_tool_task.cancel()
-            self.active_tool_task = None
+        self._cancel_tool_tasks()
         self.has_active_tool = False
         self.waiting_tool_summary = False
+        self.set_state(STATE_LISTENING)
 
     def finish_active_tool(self, turn_id: int, task: Optional[asyncio.Task] = None):
         """关键修复：仅当轮次与任务对象精确匹配时才清理 has_active_tool，防止旧任务退出冲刷新任务状态"""
-        if self.current_turn_id == turn_id:
-            if task is None or self.active_tool_task is task:
-                self.has_active_tool = False
-                if self.active_tool_task is task:
-                    self.active_tool_task = None
+        if self.current_turn_id != turn_id:
+            return
+        if task is not None and task in self.active_tool_tasks:
+            self.active_tool_tasks.remove(task)
+        if task is None or self.active_tool_task is task:
+            if self.active_tool_task is task:
+                self.active_tool_task = None
+        if self.active_tool_tasks:
+            self.has_active_tool = True
+            if self.active_tool_task is None:
+                self.active_tool_task = self.active_tool_tasks[-1]
+        else:
+            self.has_active_tool = False
+            if task is None or self.active_tool_task is task or self.active_tool_task is None:
+                self.active_tool_task = None
 
     def is_current_turn(self, turn_id: int) -> bool:
         """检查指定 turn_id 是否仍为当前最新轮次（用于丢弃迟到的旧轮次回调）"""
         return self.current_turn_id == turn_id
+
+    def is_interaction_idle(self, response: Any) -> bool:
+        """默认模型以 turn_complete 为空闲；Extended Thinking 仅在 interaction_status=IDLE 时为空闲。"""
+        server_content = getattr(response, "server_content", None)
+        if self.use_interaction_status:
+            status = getattr(response, "interaction_status", None)
+            if not status and server_content is not None:
+                status = getattr(server_content, "interaction_status", None)
+            return status == "IDLE"
+        return bool(server_content and getattr(server_content, "turn_complete", False))
+
+
+AUDIO_STREAM_END = b"__AUDIO_STREAM_END__"
+
+
+class AudioTurnQueue:
+    """音频 turn 队列：PCM 可丢，当前 turn 的结束信号不可被溢出挤掉。"""
+
+    END = AUDIO_STREAM_END
+
+    def __init__(self, maxsize: int = 250):
+        self._maxsize = maxsize
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
+
+    def _drain_nowait(self) -> list:
+        items = []
+        while True:
+            try:
+                items.append(self._queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return items
+
+    def _restore(self, items: list) -> None:
+        for item in items:
+            self._queue.put_nowait(item)
+
+    @staticmethod
+    def _drop_oldest_pcm(items: list) -> bool:
+        for i, item in enumerate(items):
+            if item != AUDIO_STREAM_END and item is not None:
+                items.pop(i)
+                return True
+        return False
+
+    def enqueue_audio(self, chunk_bytes: bytes) -> None:
+        if chunk_bytes == AUDIO_STREAM_END:
+            self.finish_turn()
+            return
+        try:
+            self._queue.put_nowait(chunk_bytes)
+            return
+        except asyncio.QueueFull:
+            items = self._drain_nowait()
+            self._drop_oldest_pcm(items)
+            if len(items) < self._maxsize:
+                items.append(chunk_bytes)
+            self._restore(items)
+
+    def finish_turn(self) -> None:
+        try:
+            self._queue.put_nowait(AUDIO_STREAM_END)
+            return
+        except asyncio.QueueFull:
+            items = self._drain_nowait()
+            if not self._drop_oldest_pcm(items) and AUDIO_STREAM_END in items:
+                self._restore(items)
+                return
+            if len(items) < self._maxsize:
+                items.append(AUDIO_STREAM_END)
+            self._restore(items)
+
+    def discard_turn(self) -> None:
+        self._drain_nowait()
+
+    async def get(self):
+        return await self._queue.get()
+
+    def close(self) -> None:
+        items = self._drain_nowait()
+        if len(items) >= self._maxsize:
+            self._drop_oldest_pcm(items)
+        if len(items) < self._maxsize:
+            items.append(None)
+        self._restore(items)
 
 
 def update_env_file(path: Path, updates: dict):
@@ -391,6 +517,172 @@ def launch_mac_app(app_name: str, bundle_id: str = "") -> str:
     return f"未能打开应用 '{app_name}': {res.stderr or res2.stderr or '未找到对应应用程序'}"
 
 
+BROWSER_TOOLS = {
+    "browser_open",
+    "browser_search",
+    "browser_get_content",
+    "browser_list_actions",
+    "browser_click",
+    "browser_scroll",
+}
+
+
+class ToolExecutor:
+    """以 ToolResultContract 为 seam，分发 native-app / kimi-cu / Ego Lite 三个 adapter。"""
+
+    def __init__(
+        self,
+        mcp_session=None,
+        launch_app: Optional[Callable[..., str]] = None,
+    ):
+        self.mcp_session = mcp_session
+        self.launch_app = launch_app or launch_mac_app
+
+    def apply_defaults(self, func_name: str, func_args: Dict[str, Any]) -> Dict[str, Any]:
+        args = dict(func_args or {})
+        if func_name in ["press_key", "type_text", "click"]:
+            if not args.get("app") and not args.get("pid"):
+                args["app"] = "com.apple.finder"
+        if func_name in ["press_key", "type_text"]:
+            args.setdefault("activate", True)
+        elif func_name == "get_app_state":
+            args.setdefault("mode", "ax")
+        return args
+
+    async def execute(self, func_name: str, func_args: Dict[str, Any]) -> ToolResultContract:
+        args = self.apply_defaults(func_name, func_args)
+        try:
+            if func_name == "open_app":
+                return await self._native_app(args)
+            if func_name in BROWSER_TOOLS:
+                return await self._ego_lite(func_name, args)
+            return await self._kimi_cu(func_name, args)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            return ToolResultContract(
+                ok=False,
+                action=func_name,
+                status="error",
+                summary="执行异常",
+                error=str(err),
+            )
+
+    async def _native_app(self, func_args: Dict[str, Any]) -> ToolResultContract:
+        target_app = func_args.get("name", "") or func_args.get("app", "")
+        target_bid = func_args.get("bundle_id", "")
+        raw_text = await asyncio.to_thread(self.launch_app, target_app, target_bid)
+        ok = raw_text.startswith("成功打开并激活应用")
+        return ToolResultContract(
+            ok=ok,
+            action="open_app",
+            status="success" if ok else "error",
+            summary=raw_text,
+            side_effects="app_launched" if ok else "none",
+            error=None if ok else raw_text,
+        )
+
+    async def _ego_lite(self, func_name: str, func_args: Dict[str, Any]) -> ToolResultContract:
+        if func_name == "browser_open":
+            url = func_args.get("url", "") or func_args.get("url_or_kw", "")
+            res_text = await browser_open(url)
+            err = is_browser_error(res_text)
+            return ToolResultContract(
+                ok=not err,
+                action="browser_open",
+                status="success" if not err else "error",
+                summary="已打开网页" if not err else res_text[:60],
+                data=res_text,
+                side_effects="navigation" if not err else "none",
+                error=res_text if err else None,
+            )
+        if func_name == "browser_search":
+            query = func_args.get("query", "")
+            engine = func_args.get("engine", "baidu")
+            res_text = await browser_search(query, engine)
+            err = is_browser_error(res_text)
+            return ToolResultContract(
+                ok=not err,
+                action="browser_search",
+                status="success" if not err else "error",
+                summary=f"已搜索关键词 '{query}'" if not err else res_text[:60],
+                data=res_text,
+                side_effects="navigation" if not err else "none",
+                error=res_text if err else None,
+            )
+        if func_name == "browser_get_content":
+            res_text = await browser_get_content()
+            err = is_browser_error(res_text)
+            return ToolResultContract(
+                ok=not err,
+                action="browser_get_content",
+                status="success" if not err else "error",
+                summary="已提取页面内容" if not err else res_text[:60],
+                data=res_text,
+                error=res_text if err else None,
+            )
+        if func_name == "browser_list_actions":
+            max_items = func_args.get("max_items", 25)
+            res_text = await browser_list_actions(max_items=max_items)
+            err = is_browser_error(res_text)
+            return ToolResultContract(
+                ok=not err,
+                action="browser_list_actions",
+                status="success" if not err else "error",
+                summary="已获取页面可操作候选项" if not err else res_text[:60],
+                data=res_text,
+                error=res_text if err else None,
+            )
+        if func_name == "browser_click":
+            target = (
+                func_args.get("text", "")
+                or func_args.get("text_or_selector", "")
+                or func_args.get("target", "")
+            )
+            res_text = await browser_click(target)
+            err = is_browser_error(res_text)
+            return ToolResultContract(
+                ok=not err,
+                action="browser_click",
+                status="success" if not err else "error",
+                summary=res_text[:80],
+                side_effects="ui_updated" if not err else "none",
+                error=res_text if err else None,
+            )
+        direction = func_args.get("direction", "down")
+        res_text = await browser_scroll(direction)
+        err = is_browser_error(res_text)
+        return ToolResultContract(
+            ok=not err,
+            action="browser_scroll",
+            status="success" if not err else "error",
+            summary=res_text[:80],
+            side_effects="ui_updated" if not err else "none",
+            error=res_text if err else None,
+        )
+
+    async def _kimi_cu(self, func_name: str, func_args: Dict[str, Any]) -> ToolResultContract:
+        mcp_res = await self.mcp_session.call_tool(func_name, func_args)
+        is_err = bool(getattr(mcp_res, "is_error", False) or getattr(mcp_res, "isError", False))
+        texts = []
+        for item in mcp_res.content:
+            if hasattr(item, "text") and item.text:
+                texts.append(item.text)
+            elif hasattr(item, "data"):
+                texts.append("[截图像素数据已捕获]")
+        raw_text = "\n".join(texts) if texts else ("MCP 执行失败" if is_err else "ok")
+        cleaned_text = format_tool_result(func_name, raw_text)
+        return ToolResultContract(
+            ok=not is_err,
+            action=func_name,
+            status="success" if not is_err else "error",
+            summary=f"已执行 {func_name}" if not is_err else f"{func_name} 执行失败",
+            data=cleaned_text,
+            side_effects="ui_updated" if not is_err else "none",
+            error=cleaned_text if is_err else None,
+        )
+
+
 # 自动配置本地代理端口
 if not os.environ.get("http_proxy") and not os.environ.get("https_proxy"):
     for port in [7890, 7897, 10808]:
@@ -460,13 +752,6 @@ SYSTEM_INSTRUCTION = """
 MIC_RATE = 16000     # 录音采样率 (16kHz, int16 单声道)
 SPK_RATE = 24000     # 播音采样率 (24kHz, int16 单声道)
 CHUNK_SIZE = 1024    # 64ms 块
-
-# 状态枚举
-STATE_LISTENING = "LISTENING"  # 空闲听用户说话
-STATE_THINKING = "THINKING"    # 用户已说完，正在等待 Gemini 思考/下发动作
-STATE_EXECUTING = "EXECUTING"  # kimi-cu 工具正在物理执行中
-STATE_SPEAKING = "SPEAKING"    # 扬声器正在平滑播报中
-
 
 def find_audio_devices(preferred_mic="Wireless Mic Rx"):
     """智能查找麦克风，自动检测支持的通道数"""
@@ -654,12 +939,9 @@ async def run_session(
         context_window_compression=context_compression_cfg,
     )
 
-    state = STATE_LISTENING
-    state_start_time = time.time()
     loop = asyncio.get_running_loop()
 
-    audio_stream_queue = asyncio.Queue(maxsize=250)
-    AUDIO_STREAM_END = b"__AUDIO_STREAM_END__"
+    audio_turn_queue = AudioTurnQueue(maxsize=250)
     reconnect_event = asyncio.Event()
 
     # 近场降噪门限参数 (初始基准值，稍后自适应对齐)
@@ -679,53 +961,26 @@ async def run_session(
     calib_samples = []
     last_cli_print_time = 0.0
 
-    turn_ctrl = TurnController()
+    turn_ctrl = TurnController(use_interaction_status="thinking" in selected_model)
+    tool_executor = ToolExecutor(mcp_session=mcp_session)
     send_lock = asyncio.Lock()
-
-    def set_state(new_state):
-        nonlocal state, state_start_time, interrupt_frames
-        if state != new_state:
-            state = new_state
-            state_start_time = time.time()
-            interrupt_frames = 0
-            log_event("STATE", f"Transitioned to {new_state}")
-
-    def safe_put_audio(chunk_bytes):
-        try:
-            audio_stream_queue.put_nowait(chunk_bytes)
-        except asyncio.QueueFull:
-            try:
-                audio_stream_queue.get_nowait()
-            except Exception:
-                pass
-            try:
-                audio_stream_queue.put_nowait(chunk_bytes)
-            except Exception:
-                pass
-
-    def drain_audio_queue():
-        while not audio_stream_queue.empty():
-            try:
-                audio_stream_queue.get_nowait()
-            except Exception:
-                break
 
     def handle_voice_barge_in(reason: str, initial_chunk: Optional[bytes] = None):
         """在事件循环主线程中线程安全地处理打断、清理队列与开启新轮次"""
         turn_ctrl.interrupt(reason)
-        drain_audio_queue()
+        audio_turn_queue.discard_turn()
         turn_ctrl.new_turn(f"speech_after_{reason}")
         if initial_chunk:
-            safe_put_audio(initial_chunk)
+            audio_turn_queue.enqueue_audio(initial_chunk)
 
     def handle_voice_speech_start(chunks_to_send: list):
         """在事件循环主线程中线程安全地开启新轮次并推送起呼前摇音频"""
         turn_ctrl.new_turn("speech_start")
         for pr_chunk in chunks_to_send:
-            safe_put_audio(pr_chunk)
+            audio_turn_queue.enqueue_audio(pr_chunk)
 
     def mic_callback(indata, frames, time_info, status):
-        nonlocal is_speaking, attack_count, silence_count, state, interrupt_frames
+        nonlocal is_speaking, attack_count, silence_count, interrupt_frames
         nonlocal START_THRESHOLD, HOLD_THRESHOLD, MIN_PEAK_RMS, INTERRUPT_RMS
         nonlocal last_cli_print_time
 
@@ -759,16 +1014,16 @@ async def run_session(
         bars = "▇" * min(12, rms // 30) + "░" * max(0, 12 - rms // 30)
 
         # 1. 扬声器播报中：检测打断
-        if state == STATE_SPEAKING:
+        if turn_ctrl.state == STATE_SPEAKING:
             if rms >= INTERRUPT_RMS:
                 interrupt_frames += 1
                 if interrupt_frames >= 2:
                     player.interrupt()
                     loop.call_soon_threadsafe(handle_voice_barge_in, "speaking", raw_bytes)
-                    set_state(STATE_LISTENING)
                     is_speaking = True
                     attack_count = 0
                     silence_count = 0
+                    interrupt_frames = 0
                     log_event("USER_INTERRUPT", f"User interrupted speaking (rms={rms})")
                     sys.stdout.write(f"\r🛑 [\033[1;31m已打断播报，请继续说...\033[0m]                           \n")
                     sys.stdout.flush()
@@ -782,16 +1037,16 @@ async def run_session(
             return
 
         # 2. kimi-cu 正在执行动作：检测到强力打断停止后续动作
-        if state == STATE_EXECUTING:
+        if turn_ctrl.state == STATE_EXECUTING:
             if rms >= INTERRUPT_RMS:
                 interrupt_frames += 1
                 if interrupt_frames >= 3:
                     player.interrupt()
                     loop.call_soon_threadsafe(handle_voice_barge_in, "executing", raw_bytes)
-                    set_state(STATE_LISTENING)
                     is_speaking = True
                     attack_count = 0
                     silence_count = 0
+                    interrupt_frames = 0
                     log_event("USER_INTERRUPT", f"User interrupted executing state (rms={rms})")
                     sys.stdout.write(f"\r🛑 [\033[1;31m已打断动作执行，请继续说...\033[0m]                           \n")
                     sys.stdout.flush()
@@ -805,16 +1060,16 @@ async def run_session(
             return
 
         # 3. 正在思考中
-        if state == STATE_THINKING:
+        if turn_ctrl.state == STATE_THINKING:
             if rms >= max(260, int(START_THRESHOLD * 1.8)):
                 interrupt_frames += 1
                 if interrupt_frames >= 3:
                     player.interrupt()
                     loop.call_soon_threadsafe(handle_voice_barge_in, "thinking", raw_bytes)
-                    set_state(STATE_LISTENING)
                     is_speaking = True
                     attack_count = 0
                     silence_count = 0
+                    interrupt_frames = 0
                     log_event("USER_INTERRUPT", f"User interrupted thinking state (rms={rms})")
                     sys.stdout.write(f"\r🛑 [\033[1;31m已取消等待，请重新说...\033[0m]                           \n")
                     sys.stdout.flush()
@@ -857,7 +1112,7 @@ async def run_session(
                     last_cli_print_time = now
         else:
             # 持续流式推送 PCM 块
-            loop.call_soon_threadsafe(safe_put_audio, raw_bytes)
+            loop.call_soon_threadsafe(audio_turn_queue.enqueue_audio, raw_bytes)
             if rms >= HOLD_THRESHOLD:
                 silence_count = 0
                 if should_print_cli:
@@ -876,8 +1131,8 @@ async def run_session(
                     silence_count = 0
                     attack_count = 0
                     # 发送音频流结束标记，通知 Gemini 即刻开始响应
-                    loop.call_soon_threadsafe(safe_put_audio, AUDIO_STREAM_END)
-                    set_state(STATE_THINKING)
+                    loop.call_soon_threadsafe(audio_turn_queue.finish_turn)
+                    loop.call_soon_threadsafe(turn_ctrl.set_state, STATE_THINKING)
                     log_event("USER_SPEECH_END", "Speech ended, queued AUDIO_STREAM_END")
                     sys.stdout.write(f"\r⚡ [\033[1;33m语音已结束，Gemini 实时响应中...\033[0m]                       \n")
                     sys.stdout.flush()
@@ -906,420 +1161,294 @@ async def run_session(
 
             handshake_done = True
 
-        mic_stream = sd.RawInputStream(
-            samplerate=MIC_RATE,
-            channels=mic_channels,
-            dtype="int16",
-            blocksize=CHUNK_SIZE,
-            device=mic_idx,
-            callback=mic_callback
-        )
-        mic_stream.start()
+            mic_stream = sd.RawInputStream(
+                samplerate=MIC_RATE,
+                channels=mic_channels,
+                dtype="int16",
+                blocksize=CHUNK_SIZE,
+                device=mic_idx,
+                callback=mic_callback
+            )
+            mic_stream.start()
 
-        # 现场底噪自适应校准
-        await asyncio.sleep(1.2)
-        if not user_threshold and calib_samples:
-            warm_samples = calib_samples[5:] if len(calib_samples) > 8 else calib_samples
-            noise_median = int(np.median(warm_samples))
-            noise_p75 = int(np.percentile(warm_samples, 75))
-            noise_mean = int(np.mean(warm_samples))
-            base_noise = noise_p75
-            START_THRESHOLD = max(65, min(160, int(base_noise * 1.7 + 25)))
-            HOLD_THRESHOLD = max(35, min(90, int(base_noise * 1.1 + 10)))
-            MIN_PEAK_RMS = max(75, int(START_THRESHOLD * 1.15))
-            INTERRUPT_RMS = max(160, int(START_THRESHOLD * 1.7))
-            log_event("CALIBRATION", f"Noise floor median={noise_median}, mean={noise_mean}, p75={noise_p75}, start_threshold={START_THRESHOLD}, hold_threshold={HOLD_THRESHOLD}, min_peak={MIN_PEAK_RMS}")
+            # 现场底噪自适应校准
+            await asyncio.sleep(1.2)
+            if not user_threshold and calib_samples:
+                warm_samples = calib_samples[5:] if len(calib_samples) > 8 else calib_samples
+                noise_median = int(np.median(warm_samples))
+                noise_p75 = int(np.percentile(warm_samples, 75))
+                noise_mean = int(np.mean(warm_samples))
+                base_noise = noise_p75
+                START_THRESHOLD = max(65, min(160, int(base_noise * 1.7 + 25)))
+                HOLD_THRESHOLD = max(35, min(90, int(base_noise * 1.1 + 10)))
+                MIN_PEAK_RMS = max(75, int(START_THRESHOLD * 1.15))
+                INTERRUPT_RMS = max(160, int(START_THRESHOLD * 1.7))
+                log_event("CALIBRATION", f"Noise floor median={noise_median}, mean={noise_mean}, p75={noise_p75}, start_threshold={START_THRESHOLD}, hold_threshold={HOLD_THRESHOLD}, min_peak={MIN_PEAK_RMS}")
 
-        is_ready_to_listen = True
-        sys.stdout.write(f"\r🟢 [\033[1;32m连接就绪，请直接对麦克风说话\033[0m] (起呼门限: {START_THRESHOLD}, 维持门限: {HOLD_THRESHOLD})                 \n")
-        sys.stdout.flush()
+            is_ready_to_listen = True
+            sys.stdout.write(f"\r🟢 [\033[1;32m连接就绪，请直接对麦克风说话\033[0m] (起呼门限: {START_THRESHOLD}, 维持门限: {HOLD_THRESHOLD})                 \n")
+            sys.stdout.flush()
 
-        # 看门狗：仅在真正彻底失联时触发重连，不误杀正常动作
-        async def watchdog_loop():
-            while not shutdown_event.is_set() and not reconnect_event.is_set():
-                await asyncio.sleep(1.0)
-                if state in [STATE_THINKING, STATE_EXECUTING] and not player.is_busy():
-                    idle_sec = time.time() - state_start_time
-                    if idle_sec > 60.0:
-                        log_event("WATCHDOG_TIMEOUT", f"Server unresponsive for {idle_sec:.1f}s, reconnecting")
-                        sys.stdout.write("\n⚠️ [\033[1;33m云端响应超时，正在自动重连并恢复会话记忆...\033[0m]\n")
-                        sys.stdout.flush()
-                        reconnect_event.set()
-                        break
-
-        # 音频流发送循环 (HybridVAD 模式，带 send_lock 保护)
-        async def send_loop():
-            try:
+            # 看门狗：仅在真正彻底失联时触发重连，不误杀正常动作
+            async def watchdog_loop():
                 while not shutdown_event.is_set() and not reconnect_event.is_set():
-                    item = await audio_stream_queue.get()
-                    if item is None:
-                        break
-                    if item == AUDIO_STREAM_END:
-                        async with send_lock:
-                            await session.send_realtime_input(audio_stream_end=True)
-                        log_event("SEND_AUDIO_STREAM_END", "Sent audio_stream_end=True to Gemini")
-                    else:
-                        async with send_lock:
-                            await session.send_realtime_input(
-                                audio=types.Blob(
-                                    data=item,
-                                    mime_type="audio/pcm;rate=16000"
+                    await asyncio.sleep(1.0)
+                    if turn_ctrl.state in [STATE_THINKING, STATE_EXECUTING] and not player.is_busy():
+                        idle_sec = time.time() - turn_ctrl.state_start_time
+                        if idle_sec > 60.0:
+                            log_event("WATCHDOG_TIMEOUT", f"Server unresponsive for {idle_sec:.1f}s, reconnecting")
+                            sys.stdout.write("\n⚠️ [\033[1;33m云端响应超时，正在自动重连并恢复会话记忆...\033[0m]\n")
+                            sys.stdout.flush()
+                            reconnect_event.set()
+                            break
+
+            # 音频流发送循环 (HybridVAD 模式，带 send_lock 保护)
+            async def send_loop():
+                try:
+                    while not shutdown_event.is_set() and not reconnect_event.is_set():
+                        item = await audio_turn_queue.get()
+                        if item is None:
+                            break
+                        if item == AudioTurnQueue.END:
+                            async with send_lock:
+                                await session.send_realtime_input(audio_stream_end=True)
+                            log_event("SEND_AUDIO_STREAM_END", "Sent audio_stream_end=True to Gemini")
+                        else:
+                            async with send_lock:
+                                await session.send_realtime_input(
+                                    audio=types.Blob(
+                                        data=item,
+                                        mime_type="audio/pcm;rate=16000"
+                                    )
+                                )
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    log_event("SEND_ERROR", str(e))
+                    reconnect_event.set()
+
+            # 异步工具执行任务：在独立后台任务中执行，完全不阻塞 recv_loop 接收打断信令
+            async def execute_tools_task(target_turn_id: int, tool_call: Any, token: CancellationToken):
+                current_task = asyncio.current_task()
+                try:
+                    if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
+                        return
+                    function_responses = []
+                    for call in tool_call.function_calls:
+                        if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
+                            break
+
+                        func_name = call.name
+                        func_args = call.args or {}
+
+                        allowed, policy_contract = policy_manager.check_execution(
+                            func_name, func_args, cancellation_token=token
+                        )
+
+                        if not allowed:
+                            log_event("POLICY_BLOCK", f"Tool {func_name} blocked: {policy_contract.summary}")
+                            print(f"\n🛡️  [安全策略拦截] \033[1;31m{func_name}\033[0m: {policy_contract.summary}")
+                            function_responses.append(
+                                types.FunctionResponse(
+                                    name=func_name,
+                                    id=call.id,
+                                    response={"result": policy_contract.to_gemini_response()}
                                 )
                             )
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                log_event("SEND_ERROR", str(e))
-                reconnect_event.set()
+                            continue
 
-        # 异步工具执行任务：在独立后台任务中执行，完全不阻塞 recv_loop 接收打断信令
-        async def execute_tools_task(target_turn_id: int, tool_call: Any, token: CancellationToken):
-            current_task = asyncio.current_task()
-            try:
-                if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
-                    return
-                function_responses = []
-                for call in tool_call.function_calls:
-                    if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
-                        break
+                        log_event("TOOL_CALL", f"Calling {func_name} with args: {func_args}")
+                        print(f"\n🛠️  [执行动作] \033[1;33m{func_name}\033[0m({func_args})")
 
-                    func_name = call.name
-                    func_args = call.args or {}
+                        t_start = time.time()
+                        contract = await tool_executor.execute(func_name, func_args)
 
-                    allowed, policy_contract = policy_manager.check_execution(
-                        func_name, func_args, cancellation_token=token
-                    )
+                        cost_ms = int((time.time() - t_start) * 1000)
+                        log_event("TOOL_RESULT", f"{func_name} ({cost_ms}ms) status={contract.status}")
+                        print(f"✨ [{func_name} 完成] ({cost_ms}ms, {contract.summary[:60]})")
+                        current_tools_executed.append(f"{func_name}: {contract.summary[:60]}")
 
-                    if not allowed:
-                        log_event("POLICY_BLOCK", f"Tool {func_name} blocked: {policy_contract.summary}")
-                        print(f"\n🛡️  [安全策略拦截] \033[1;31m{func_name}\033[0m: {policy_contract.summary}")
                         function_responses.append(
                             types.FunctionResponse(
                                 name=func_name,
                                 id=call.id,
-                                response={"result": policy_contract.to_gemini_response()}
+                                response={"result": contract.to_gemini_response()}
                             )
                         )
-                        continue
 
-                    log_event("TOOL_CALL", f"Calling {func_name} with args: {func_args}")
-                    print(f"\n🛠️  [执行动作] \033[1;33m{func_name}\033[0m({func_args})")
+                    if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
+                        log_event("TOOL_CANCELLED_DROP", f"Tools result dropped due to turn cancellation (turn {target_turn_id})")
+                        return
 
-                    if func_name in ["press_key", "type_text", "click"]:
-                        if not func_args.get("app") and not func_args.get("pid"):
-                            func_args["app"] = "com.apple.finder"
+                    if function_responses:
+                        async with send_lock:
+                            await session.send_tool_response(function_responses=function_responses)
+                        log_event("TOOL_RESPONSE_SENT", f"Sent response for {len(function_responses)} calls, waiting for Gemini summary")
+                        if turn_ctrl.is_current_turn(target_turn_id):
+                            turn_ctrl.waiting_tool_summary = True
+                            turn_ctrl.set_state(STATE_THINKING)
+                except asyncio.CancelledError:
+                    log_event("TOOL_TASK_CANCELLED", f"Active tool task cancelled for turn {target_turn_id}")
+                except Exception as e:
+                    log_event("TOOL_TASK_ERROR", f"Error in execute_tools_task: {e}")
+                finally:
+                    turn_ctrl.finish_active_tool(target_turn_id, current_task)
 
-                    if func_name in ["press_key", "type_text"]:
-                        func_args.setdefault("activate", True)
-                    elif func_name == "get_app_state":
-                        func_args.setdefault("mode", "ax")
+            # 接收循环：常驻监听，使用公开 session.receive() 迭代器
+            async def recv_loop():
+                nonlocal current_user_transcript, current_model_transcript, current_tools_executed
 
-                    t_start = time.time()
-                    try:
-                        if func_name == "open_app":
-                            target_app = func_args.get("name", "") or func_args.get("app", "")
-                            target_bid = func_args.get("bundle_id", "")
-                            raw_text = await asyncio.to_thread(launch_mac_app, target_app, target_bid)
-                            contract = ToolResultContract(
-                                ok="成功" in raw_text,
-                                action="open_app",
-                                status="success" if "成功" in raw_text else "error",
-                                summary=raw_text,
-                                side_effects="app_launched"
-                            )
-                        elif func_name == "browser_open":
-                            url = func_args.get("url", "") or func_args.get("url_or_kw", "")
-                            res_text = await browser_open(url)
-                            err = is_browser_error(res_text)
-                            contract = ToolResultContract(
-                                ok=not err,
-                                action="browser_open",
-                                status="success" if not err else "error",
-                                summary="已打开网页" if not err else res_text[:60],
-                                data=res_text,
-                                side_effects="navigation" if not err else "none",
-                                error=res_text if err else None
-                            )
-                        elif func_name == "browser_search":
-                            query = func_args.get("query", "")
-                            engine = func_args.get("engine", "baidu")
-                            res_text = await browser_search(query, engine)
-                            err = is_browser_error(res_text)
-                            contract = ToolResultContract(
-                                ok=not err,
-                                action="browser_search",
-                                status="success" if not err else "error",
-                                summary=f"已搜索关键词 '{query}'" if not err else res_text[:60],
-                                data=res_text,
-                                side_effects="navigation" if not err else "none",
-                                error=res_text if err else None
-                            )
-                        elif func_name == "browser_get_content":
-                            res_text = await browser_get_content()
-                            err = is_browser_error(res_text)
-                            contract = ToolResultContract(
-                                ok=not err,
-                                action="browser_get_content",
-                                status="success" if not err else "error",
-                                summary="已提取页面内容" if not err else res_text[:60],
-                                data=res_text,
-                                error=res_text if err else None
-                            )
-                        elif func_name == "browser_list_actions":
-                            max_items = func_args.get("max_items", 25)
-                            res_text = await browser_list_actions(max_items=max_items)
-                            err = is_browser_error(res_text)
-                            contract = ToolResultContract(
-                                ok=not err,
-                                action="browser_list_actions",
-                                status="success" if not err else "error",
-                                summary="已获取页面可操作候选项" if not err else res_text[:60],
-                                data=res_text,
-                                error=res_text if err else None
-                            )
-                        elif func_name == "browser_click":
-                            target = func_args.get("text", "") or func_args.get("text_or_selector", "") or func_args.get("target", "")
-                            res_text = await browser_click(target)
-                            err = is_browser_error(res_text) or ("已成功点击" not in res_text)
-                            contract = ToolResultContract(
-                                ok=not err,
-                                action="browser_click",
-                                status="success" if not err else "error",
-                                summary=res_text[:80],
-                                side_effects="ui_updated" if not err else "none",
-                                error=res_text if err else None
-                            )
-                        elif func_name == "browser_scroll":
-                            direction = func_args.get("direction", "down")
-                            res_text = await browser_scroll(direction)
-                            err = is_browser_error(res_text)
-                            contract = ToolResultContract(
-                                ok=not err,
-                                action="browser_scroll",
-                                status="success" if not err else "error",
-                                summary=res_text[:80],
-                                side_effects="ui_updated" if not err else "none",
-                                error=res_text if err else None
-                            )
-                        else:
-                            mcp_res = await mcp_session.call_tool(func_name, func_args)
-                            is_err = bool(getattr(mcp_res, "is_error", False) or getattr(mcp_res, "isError", False))
-                            texts = []
-                            for item in mcp_res.content:
-                                if hasattr(item, "text") and item.text:
-                                    texts.append(item.text)
-                                elif hasattr(item, "data"):
-                                    texts.append("[截图像素数据已捕获]")
-                            raw_text = "\n".join(texts) if texts else ("MCP 执行失败" if is_err else "ok")
-                            cleaned_text = format_tool_result(func_name, raw_text)
-                            contract = ToolResultContract(
-                                ok=not is_err,
-                                action=func_name,
-                                status="success" if not is_err else "error",
-                                summary=f"已执行 {func_name}" if not is_err else f"{func_name} 执行失败",
-                                data=cleaned_text,
-                                side_effects="ui_updated" if not is_err else "none",
-                                error=cleaned_text if is_err else None
-                            )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as err:
-                        contract = ToolResultContract(
-                            ok=False,
-                            action=func_name,
-                            status="error",
-                            summary="执行异常",
-                            error=str(err)
-                        )
+                try:
+                    while not shutdown_event.is_set() and not reconnect_event.is_set():
+                        policy_manager.reset_turn()
+                        messages_in_turn = 0
 
-                    cost_ms = int((time.time() - t_start) * 1000)
-                    log_event("TOOL_RESULT", f"{func_name} ({cost_ms}ms) status={contract.status}")
-                    print(f"✨ [{func_name} 完成] ({cost_ms}ms, {contract.summary[:60]})")
-                    current_tools_executed.append(f"{func_name}: {contract.summary[:60]}")
+                        async for response in session.receive():
+                            messages_in_turn += 1
+                            if shutdown_event.is_set() or reconnect_event.is_set():
+                                break
 
-                    function_responses.append(
-                        types.FunctionResponse(
-                            name=func_name,
-                            id=call.id,
-                            response={"result": contract.to_gemini_response()}
-                        )
-                    )
+                            # 0. 检查官方会话恢复句柄更新 (Session Resumption Update)
+                            if getattr(response, "session_resumption_update", None):
+                                upd = response.session_resumption_update
+                                if upd.resumable and upd.new_handle:
+                                    session_state["handle"] = upd.new_handle
+                                    log_event("RESUMPTION_HANDLE", f"Updated resumption handle: {upd.new_handle[:16]}...")
 
-                if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
-                    log_event("TOOL_CANCELLED_DROP", f"Tools result dropped due to turn cancellation (turn {target_turn_id})")
-                    return
+                            # 0.1 检查服务端 GoAway 通知 (平滑重连)
+                            if getattr(response, "go_away", None):
+                                log_event("SERVER_GO_AWAY", "Server issued GoAway signal, graceful reconnect triggered")
+                                reconnect_event.set()
+                                break
 
-                if function_responses:
-                    async with send_lock:
-                        await session.send_tool_response(function_responses=function_responses)
-                    log_event("TOOL_RESPONSE_SENT", f"Sent response for {len(function_responses)} calls, waiting for Gemini summary")
-                    if turn_ctrl.is_current_turn(target_turn_id):
-                        turn_ctrl.waiting_tool_summary = True
-                        set_state(STATE_THINKING)
-            except asyncio.CancelledError:
-                log_event("TOOL_TASK_CANCELLED", f"Active tool task cancelled for turn {target_turn_id}")
-            except Exception as e:
-                log_event("TOOL_TASK_ERROR", f"Error in execute_tools_task: {e}")
-            finally:
-                turn_ctrl.finish_active_tool(target_turn_id, current_task)
+                            # 0.2 检查服务端下发的工具取消信号
+                            if getattr(response, "tool_call_cancellation", None) and response.tool_call_cancellation.ids:
+                                cancelled_ids = set(response.tool_call_cancellation.ids)
+                                log_event("SERVER_TOOL_CANCEL", f"Server cancelled tool call IDs: {cancelled_ids}")
+                                turn_ctrl.interrupt("Server cancelled tool call")
 
-        # 接收循环：常驻监听，使用公开 session.receive() 迭代器
-        async def recv_loop():
-            nonlocal state
-            nonlocal current_user_transcript, current_model_transcript, current_tools_executed
+                            # 1. 检查服务端打断信号
+                            if response.server_content and response.server_content.interrupted:
+                                player.interrupt()
+                                turn_ctrl.interrupt("Server reported interrupted")
+                                log_event("SERVER_INTERRUPT", "Server reported interrupted")
+
+                            # 1.5 语音实时转录展示与收集
+                            if response.server_content:
+                                if response.server_content.input_transcription and response.server_content.input_transcription.text:
+                                    txt = response.server_content.input_transcription.text.strip()
+                                    if txt:
+                                        current_user_transcript.append(txt)
+                                        log_event("USER_TRANSCRIPT", txt)
+                                        sys.stdout.write(f"\n👤 [\033[1;32m用户语音转录\033[0m] {txt}\n")
+                                        sys.stdout.flush()
+                                if response.server_content.output_transcription and response.server_content.output_transcription.text:
+                                    txt = response.server_content.output_transcription.text.strip()
+                                    if txt:
+                                        current_model_transcript.append(txt)
+                                        log_event("MODEL_TRANSCRIPT", txt)
+                                        sys.stdout.write(f"\n🤖 [\033[1;36mGemini 播报转录\033[0m] {txt}\n")
+                                        sys.stdout.flush()
+
+                            # 2. 模型回复内容（思考、文本与音频）
+                            if response.server_content and response.server_content.model_turn:
+                                turn_ctrl.waiting_tool_summary = False
+                                for part in response.server_content.model_turn.parts:
+                                    if part.text:
+                                        if getattr(part, "thought", False):
+                                            log_event("MODEL_THOUGHT", part.text.strip())
+                                            sys.stdout.write(f"\033[90m💭 {part.text}\033[0m")
+                                        else:
+                                            current_model_transcript.append(part.text)
+                                            log_event("MODEL_TEXT", part.text.strip())
+                                            sys.stdout.write(part.text)
+                                        sys.stdout.flush()
+                                    if part.inline_data:
+                                        if turn_ctrl.is_interrupted or turn_ctrl.cancellation_token.is_cancelled:
+                                            continue
+                                        turn_ctrl.set_state(STATE_SPEAKING)
+                                        player.write(part.inline_data.data)
+
+                            # 3. 工具调用请求（异步解耦至独立后台任务，绝不阻塞 recv_loop）
+                            if response.tool_call:
+                                turn_ctrl.waiting_tool_summary = False
+                                turn_ctrl.set_state(STATE_EXECUTING)
+                                turn_id = turn_ctrl.current_turn_id
+                                token = turn_ctrl.cancellation_token
+                                tool_task = asyncio.create_task(
+                                    execute_tools_task(turn_id, response.tool_call, token)
+                                )
+                                turn_ctrl.register_tool_task(tool_task)
+
+                            # 4. 轮次终结：沉淀记忆至本地记忆池，通过 target_turn_id 隔离旧播放回调
+                            # 默认模型看 turn_complete；--thinking 仅在 interaction_status=IDLE 时视为空闲
+                            if turn_ctrl.is_interaction_idle(response):
+                                if not response.tool_call and not turn_ctrl.has_active_tool and not turn_ctrl.waiting_tool_summary:
+                                    u_txt = " ".join(current_user_transcript).strip()
+                                    m_txt = "".join(current_model_transcript).strip()
+                                    t_summary = "; ".join(current_tools_executed).strip()
+                                    if u_txt or m_txt or t_summary:
+                                        memory.record_turn(user_text=u_txt, model_text=m_txt, tool_summary=t_summary)
+                                        log_event("MEMORY_RECORDED", f"Memory updated (user='{u_txt[:30]}', model='{m_txt[:30]}', tools='{t_summary[:40]}')")
+
+                                    current_user_transcript = []
+                                    current_model_transcript = []
+                                    current_tools_executed = []
+
+                                    completed_turn_id = turn_ctrl.current_turn_id
+
+                                    async def wait_for_playback_done(target_turn_id: int):
+                                        wait_start = time.time()
+                                        while player.is_busy() and (time.time() - wait_start < 15.0):
+                                            await asyncio.sleep(0.05)
+                                        await asyncio.sleep(0.1)
+                                        # 隔离保护：仅当仍属于当前轮次且未被打断时，才切换为 LISTENING
+                                        if not turn_ctrl.is_current_turn(target_turn_id) or turn_ctrl.cancellation_token.is_cancelled:
+                                            log_event("DISCARD_OLD_TURN_CALLBACK", f"Turn {target_turn_id} playback callback discarded (current turn is {turn_ctrl.current_turn_id})")
+                                            return
+                                        turn_ctrl.set_state(STATE_LISTENING)
+                                        turn_ctrl.cancellation_token = CancellationToken(f"turn_{time.time()}")
+                                        log_event("TURN_COMPLETE", f"Turn {target_turn_id} fully finished and playback done, now LISTENING")
+                                        sys.stdout.write("\n🟢 [\033[1;32m就绪，请说下一句指令...\033[0m]\n")
+                                        sys.stdout.flush()
+
+                                    asyncio.create_task(wait_for_playback_done(completed_turn_id))
+
+                        if messages_in_turn == 0 and not shutdown_event.is_set() and not reconnect_event.is_set():
+                            await asyncio.sleep(0.05)
+
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    log_event("RECV_ERROR", str(e))
+                    reconnect_event.set()
+                finally:
+                    turn_ctrl.set_state(STATE_LISTENING)
+
+            current_user_transcript = []
+            current_model_transcript = []
+            current_tools_executed = []
+
+            task_send = asyncio.create_task(send_loop())
+            task_recv = asyncio.create_task(recv_loop())
+            task_watchdog = asyncio.create_task(watchdog_loop())
 
             try:
-                while not shutdown_event.is_set() and not reconnect_event.is_set():
-                    policy_manager.reset_turn()
-                    messages_in_turn = 0
-
-                    async for response in session.receive():
-                        messages_in_turn += 1
-                        if shutdown_event.is_set() or reconnect_event.is_set():
-                            break
-
-                        # 0. 检查官方会话恢复句柄更新 (Session Resumption Update)
-                        if getattr(response, "session_resumption_update", None):
-                            upd = response.session_resumption_update
-                            if upd.resumable and upd.new_handle:
-                                session_state["handle"] = upd.new_handle
-                                log_event("RESUMPTION_HANDLE", f"Updated resumption handle: {upd.new_handle[:16]}...")
-
-                        # 0.1 检查服务端 GoAway 通知 (平滑重连)
-                        if getattr(response, "go_away", None):
-                            log_event("SERVER_GO_AWAY", "Server issued GoAway signal, graceful reconnect triggered")
-                            reconnect_event.set()
-                            break
-
-                        # 0.2 检查服务端下发的工具取消信号
-                        if getattr(response, "tool_call_cancellation", None) and response.tool_call_cancellation.ids:
-                            cancelled_ids = set(response.tool_call_cancellation.ids)
-                            log_event("SERVER_TOOL_CANCEL", f"Server cancelled tool call IDs: {cancelled_ids}")
-                            turn_ctrl.interrupt("Server cancelled tool call")
-
-                        # 1. 检查服务端打断信号
-                        if response.server_content and response.server_content.interrupted:
-                            player.interrupt()
-                            turn_ctrl.interrupt("Server reported interrupted")
-                            set_state(STATE_LISTENING)
-                            log_event("SERVER_INTERRUPT", "Server reported interrupted")
-
-                        # 1.5 语音实时转录展示与收集
-                        if response.server_content:
-                            if response.server_content.input_transcription and response.server_content.input_transcription.text:
-                                txt = response.server_content.input_transcription.text.strip()
-                                if txt:
-                                    current_user_transcript.append(txt)
-                                    log_event("USER_TRANSCRIPT", txt)
-                                    sys.stdout.write(f"\n👤 [\033[1;32m用户语音转录\033[0m] {txt}\n")
-                                    sys.stdout.flush()
-                            if response.server_content.output_transcription and response.server_content.output_transcription.text:
-                                txt = response.server_content.output_transcription.text.strip()
-                                if txt:
-                                    current_model_transcript.append(txt)
-                                    log_event("MODEL_TRANSCRIPT", txt)
-                                    sys.stdout.write(f"\n🤖 [\033[1;36mGemini 播报转录\033[0m] {txt}\n")
-                                    sys.stdout.flush()
-
-                        # 2. 模型回复内容（思考、文本与音频）
-                        if response.server_content and response.server_content.model_turn:
-                            turn_ctrl.waiting_tool_summary = False
-                            for part in response.server_content.model_turn.parts:
-                                if part.text:
-                                    if getattr(part, "thought", False):
-                                        log_event("MODEL_THOUGHT", part.text.strip())
-                                        sys.stdout.write(f"\033[90m💭 {part.text}\033[0m")
-                                    else:
-                                        current_model_transcript.append(part.text)
-                                        log_event("MODEL_TEXT", part.text.strip())
-                                        sys.stdout.write(part.text)
-                                    sys.stdout.flush()
-                                if part.inline_data:
-                                    if turn_ctrl.is_interrupted or turn_ctrl.cancellation_token.is_cancelled:
-                                        continue
-                                    set_state(STATE_SPEAKING)
-                                    player.write(part.inline_data.data)
-
-                        # 3. 工具调用请求（异步解耦至独立后台任务，绝不阻塞 recv_loop）
-                        if response.tool_call:
-                            turn_ctrl.has_active_tool = True
-                            turn_ctrl.waiting_tool_summary = False
-                            set_state(STATE_EXECUTING)
-                            turn_id = turn_ctrl.current_turn_id
-                            token = turn_ctrl.cancellation_token
-                            turn_ctrl.active_tool_task = asyncio.create_task(
-                                execute_tools_task(turn_id, response.tool_call, token)
-                            )
-
-                        # 4. 轮次终结：沉淀记忆至本地记忆池，通过 target_turn_id 隔离旧播放回调
-                        if response.server_content and response.server_content.turn_complete:
-                            if not response.tool_call and not turn_ctrl.has_active_tool and not turn_ctrl.waiting_tool_summary:
-                                u_txt = " ".join(current_user_transcript).strip()
-                                m_txt = "".join(current_model_transcript).strip()
-                                t_summary = "; ".join(current_tools_executed).strip()
-                                if u_txt or m_txt or t_summary:
-                                    memory.record_turn(user_text=u_txt, model_text=m_txt, tool_summary=t_summary)
-                                    log_event("MEMORY_RECORDED", f"Memory updated (user='{u_txt[:30]}', model='{m_txt[:30]}', tools='{t_summary[:40]}')")
-
-                                current_user_transcript = []
-                                current_model_transcript = []
-                                current_tools_executed = []
-
-                                completed_turn_id = turn_ctrl.current_turn_id
-
-                                async def wait_for_playback_done(target_turn_id: int):
-                                    wait_start = time.time()
-                                    while player.is_busy() and (time.time() - wait_start < 15.0):
-                                        await asyncio.sleep(0.05)
-                                    await asyncio.sleep(0.1)
-                                    # 隔离保护：仅当仍属于当前轮次且未被打断时，才切换为 LISTENING
-                                    if not turn_ctrl.is_current_turn(target_turn_id) or turn_ctrl.cancellation_token.is_cancelled:
-                                        log_event("DISCARD_OLD_TURN_CALLBACK", f"Turn {target_turn_id} playback callback discarded (current turn is {turn_ctrl.current_turn_id})")
-                                        return
-                                    set_state(STATE_LISTENING)
-                                    turn_ctrl.cancellation_token = CancellationToken(f"turn_{time.time()}")
-                                    log_event("TURN_COMPLETE", f"Turn {target_turn_id} fully finished and playback done, now LISTENING")
-                                    sys.stdout.write("\n🟢 [\033[1;32m就绪，请说下一句指令...\033[0m]\n")
-                                    sys.stdout.flush()
-
-                                asyncio.create_task(wait_for_playback_done(completed_turn_id))
-
-                    if messages_in_turn == 0 and not shutdown_event.is_set() and not reconnect_event.is_set():
-                        await asyncio.sleep(0.05)
-
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                log_event("RECV_ERROR", str(e))
-                reconnect_event.set()
+                # 只有当用户退出或发生底层网络断线事件时才跳出 wait
+                await asyncio.wait([task_send, task_recv, task_watchdog], return_when=asyncio.FIRST_COMPLETED)
             finally:
-                set_state(STATE_LISTENING)
+                task_send.cancel()
+                task_recv.cancel()
+                task_watchdog.cancel()
+                turn_ctrl._cancel_tool_tasks()
+                try:
+                    mic_stream.stop()
+                    mic_stream.close()
+                except Exception:
+                    pass
 
-        current_user_transcript = []
-        current_model_transcript = []
-        current_tools_executed = []
-
-        task_send = asyncio.create_task(send_loop())
-        task_recv = asyncio.create_task(recv_loop())
-        task_watchdog = asyncio.create_task(watchdog_loop())
-
-        try:
-            # 只有当用户退出或发生底层网络断线事件时才跳出 wait
-            await asyncio.wait([task_send, task_recv, task_watchdog], return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            task_send.cancel()
-            task_recv.cancel()
-            task_watchdog.cancel()
-            if turn_ctrl.active_tool_task and not turn_ctrl.active_tool_task.done():
-                turn_ctrl.active_tool_task.cancel()
-            try:
-                mic_stream.stop()
-                mic_stream.close()
-            except Exception:
-                pass
-
-        if reconnect_event.is_set():
-            raise ConnectionError("Live 连接断开或触发平滑重连 (reconnect_event)")
+            if reconnect_event.is_set():
+                raise ConnectionError("Live 连接断开或触发平滑重连 (reconnect_event)")
     except asyncio.CancelledError:
         raise
     except Exception as e:

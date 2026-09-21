@@ -29,7 +29,7 @@ uv run --locked python gemini_live_cu.py
 uv run python test_suite.py
 
 # 运行特定测试层级
-uv run python test_suite.py --layer 0    # Layer 0: 安全策略与防死循环单测 (20项)
+uv run python test_suite.py --layer 0    # Layer 0: 安全策略与防死循环单测 (25项)
 uv run python test_suite.py --layer 1    # Layer 1: 真实应用深度闭环基座测试
 uv run python test_suite.py --layer 2    # Layer 2: 真实 PCM 语音驱动端到端评测
 uv run python test_suite.py --layer 3    # Layer 3: 硬件麦克风与自适应 VAD 检查
