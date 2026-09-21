@@ -93,6 +93,7 @@ WRITE_TOOLS = {
     "click",
     "type_text",
     "browser_click",
+    "browser_close",
     "press_key",
     "scroll",
 }

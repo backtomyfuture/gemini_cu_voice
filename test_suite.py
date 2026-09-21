@@ -61,7 +61,8 @@ from tool_policy import (
     ToolResultContract,
     CancellationToken,
     PolicyLevel,
-    is_browser_error
+    is_browser_error,
+    WRITE_TOOLS,
 )
 from gemini_live_cu import (
     launch_mac_app,
@@ -72,12 +73,16 @@ from gemini_live_cu import (
     ConversationMemory,
     TurnController,
     ResumptionHandleExpiredError,
+    GoAwayReconnectError,
     run_session,
     AudioTurnQueue,
     ToolExecutor,
     STATE_LISTENING,
     STATE_THINKING,
     STATE_SPEAKING,
+    BROWSER_TOOLS,
+    CUSTOM_ASR_VOCABULARY,
+    build_gemini_function_declarations,
 )
 from ego_browser_client import (
     browser_open,
@@ -1716,6 +1721,93 @@ async def test_layer_0(report: TestReport):
         cost,
     )
 
+    # 0.28 browser_close 路由派发与安全策略一致性 (Browser Close Route & Write Policy Gating)
+    t0 = time.time()
+    decl_names = {d.name for d in get_browser_function_declarations()}
+    browser_tools_synced = (BROWSER_TOOLS == decl_names) and ("browser_close" in BROWSER_TOOLS)
+    policy_write_synced = "browser_close" in WRITE_TOOLS
+
+    with mock.patch("gemini_live_cu.browser_close", new=mock.AsyncMock(return_value="已关闭标签页")):
+        close_res = await executor.execute("browser_close", {"close_window": True})
+    close_routed = close_res.ok and close_res.action == "browser_close" and close_res.side_effects == "window_closed"
+
+    b_close_ok = browser_tools_synced and policy_write_synced and close_routed
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "路由与策略: browser_close 自动派发至 Ego 且归属于写操作策略 (Browser Close Seam & Policy)",
+        b_close_ok,
+        f"集合同步={browser_tools_synced}, 写策略覆盖={policy_write_synced}, Ego派发={close_routed}",
+        cost,
+    )
+
+    # 0.29 Gemini 3.8 函数调用行为规范 (Behavior Specification on 3.8 Live & Thinking)
+    t0 = time.time()
+    dummy_mcp_tool = type("MCPTool", (), {
+        "name": "click",
+        "description": "点击控件",
+        "input_schema": {"type": "object", "properties": {"index": {"type": "integer"}}}
+    })()
+
+    fast_decls = build_gemini_function_declarations([dummy_mcp_tool], is_extended_thinking=False)
+    thinking_decls = build_gemini_function_declarations([dummy_mcp_tool], is_extended_thinking=True)
+
+    from google.genai import types
+    all_fast_blocking = all(getattr(d, "behavior", None) == types.Behavior.BLOCKING for d in fast_decls)
+    all_thinking_non_blocking = all(getattr(d, "behavior", None) == types.Behavior.NON_BLOCKING for d in thinking_decls)
+
+    behavior_ok = all_fast_blocking and all_thinking_non_blocking
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "函数规范: Gemini 3.8 极速模型显式声明 BLOCKING，Thinking 模型声明 NON_BLOCKING (Tool Behavior Spec)",
+        behavior_ok,
+        f"极速模型BLOCKING={all_fast_blocking} ({len(fast_decls)}个), Thinking模型NON_BLOCKING={all_thinking_non_blocking} ({len(thinking_decls)}个)",
+        cost,
+    )
+
+    # 0.30 轮次预算生命周期与多段交互隔离 (Turn Budget Ownership in new_turn)
+    t0 = time.time()
+    pm = ToolPolicyManager(strict_mode=True, max_tools_per_turn=2)
+    t_ctrl = TurnController(policy_manager=pm)
+
+    pm.check_execution("click", {"index": 1})
+    pm.check_execution("click", {"index": 2})
+    blocked_third, _ = pm.check_execution("click", {"index": 3})
+
+    # 模拟中途 receive() 多段输出，预算不能被随意清空
+    mid_turn_still_blocked, _ = pm.check_execution("click", {"index": 3})
+
+    # 只有显式进入新轮次 (如用户重新开口说话)，才重置预算
+    t_ctrl.new_turn("user_spoke_again")
+    new_turn_allowed, _ = pm.check_execution("click", {"index": 1})
+
+    budget_isolation_ok = (not blocked_third) and (not mid_turn_still_blocked) and new_turn_allowed
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "预算隔离: 工具调用预算由 new_turn 生命周期管理，杜绝异步交互中途清零 (Budget Lifecycle Ownership)",
+        budget_isolation_ok,
+        f"超限拦截={not blocked_third}, 轮内持续拦截={not mid_turn_still_blocked}, 新轮次放行={new_turn_allowed}",
+        cost,
+    )
+
+    # 0.31 GoAway 快速重连与继承体系契约 (GoAway Reconnect Contract)
+    t0 = time.time()
+    err = GoAwayReconnectError(time_left="5s")
+    is_conn_error = isinstance(err, ConnectionError)
+    has_time_left = err.time_left == "5s"
+
+    goaway_contract_ok = is_conn_error and has_time_left
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "连接治理: GoAwayReconnectError 继承 ConnectionError 且携带 time_left (GoAway Reconnect Contract)",
+        goaway_contract_ok,
+        f"继承ConnectionError={is_conn_error}, 携带time_left={has_time_left}",
+        cost,
+    )
+
 
 # ==============================================================================
 # Layer 1: 音频硬件与近场 VAD 门控健康检查 (Audio Hardware & VAD Health Boundary)
@@ -1768,10 +1860,10 @@ def test_layer_1(report: TestReport, prefer_mic="Wireless Mic Rx"):
 
         p75 = int(np.percentile(warm, 75))
         median = int(np.median(warm))
-        computed_start = max(65, min(160, int(p75 * 1.7 + 25)))
-        computed_hold = max(35, min(90, int(p75 * 1.1 + 10)))
+        computed_start = max(55, min(85, int(p75 * 1.25 + 12)))
+        computed_hold = max(30, min(45, int(computed_start * 0.45)))
 
-        is_healthy = (65 <= computed_start <= 160) and (computed_hold < computed_start)
+        is_healthy = (55 <= computed_start <= 85) and (computed_hold < computed_start)
         detail = f"采样底噪 P75={p75}, Median={median} -> 自适应起呼门限={computed_start}, 维持门限={computed_hold}"
         report.record("Layer 1", "自适应门限健康度诊断", is_healthy, detail, cost)
 

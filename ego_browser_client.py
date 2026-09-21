@@ -388,6 +388,27 @@ try {{
                 match = elements.find(el => el.innerText && el.innerText.toLowerCase().includes(prefix));
             }}
 
+            // 3.4 空格分词联合匹配（针对复合短语如 "IT之家 官方"）
+            if (!match && cleanTxt.includes(" ")) {{
+                const words = cleanTxt.split(/\\s+/).filter(w => w.length > 0);
+                if (words.length > 1) {{
+                    match = elements.find(el => {{
+                        const t = (el.innerText || "").toLowerCase();
+                        return words.every(w => t.includes(w));
+                    }});
+                    if (!match) {{
+                        const containers = Array.from(document.querySelectorAll("a, button, li, tr, [role='listitem'], div.result, div.c-container"));
+                        const matchedContainer = containers.find(c => {{
+                            const t = (c.innerText || "").toLowerCase();
+                            return words.every(w => t.includes(w));
+                        }});
+                        if (matchedContainer) {{
+                            match = matchedContainer.querySelector("a") || matchedContainer.querySelector("button") || matchedContainer;
+                        }}
+                    }}
+                }}
+            }}
+
             if (match) {{
                 const anchor = match.closest("a") || match.closest("button") || match;
                 anchor.scrollIntoView({{ block: "center" }});
@@ -550,9 +571,11 @@ try {{
     return "已成功关闭 Ego Lite 独立任务空间（TaskSpace），保留浏览器正常运行"
 
 
-def get_browser_function_declarations():
-    """返回供 Gemini 注册使用的 Ego Lite 浏览器功能声明列表"""
+def get_browser_function_declarations(behavior: Optional[str] = None):
+    """返回供 Gemini 注册使用的 Ego Lite 浏览器功能声明列表，支持按模型指定 behavior (BLOCKING/NON_BLOCKING)"""
     from google.genai import types
+
+    kwargs = {"behavior": behavior} if behavior else {}
 
     return [
         types.FunctionDeclaration(
@@ -567,7 +590,8 @@ def get_browser_function_declarations():
                     }
                 },
                 "required": ["url"]
-            }
+            },
+            **kwargs,
         ),
         types.FunctionDeclaration(
             name="browser_search",
@@ -585,7 +609,8 @@ def get_browser_function_declarations():
                     }
                 },
                 "required": ["query"]
-            }
+            },
+            **kwargs,
         ),
         types.FunctionDeclaration(
             name="browser_get_content",
@@ -593,7 +618,8 @@ def get_browser_function_declarations():
             parameters={
                 "type": "object",
                 "properties": {}
-            }
+            },
+            **kwargs,
         ),
         types.FunctionDeclaration(
             name="browser_list_actions",
@@ -606,7 +632,8 @@ def get_browser_function_declarations():
                         "description": "最多提取的操作项数量，默认 25"
                     }
                 }
-            }
+            },
+            **kwargs,
         ),
         types.FunctionDeclaration(
             name="browser_click",
@@ -620,7 +647,8 @@ def get_browser_function_declarations():
                     }
                 },
                 "required": ["text"]
-            }
+            },
+            **kwargs,
         ),
         types.FunctionDeclaration(
             name="browser_scroll",
@@ -633,7 +661,8 @@ def get_browser_function_declarations():
                         "description": "滚动方向，'down' (向下滚动), 'up' (向上滚动), 'bottom' (滚动到底部), 'top' (回到顶部)，默认 'down'"
                     }
                 }
-            }
+            },
+            **kwargs,
         ),
         types.FunctionDeclaration(
             name="browser_close",
@@ -646,6 +675,7 @@ def get_browser_function_declarations():
                         "description": "是否彻底退出浏览器应用窗口，默认为 true"
                     }
                 }
-            }
+            },
+            **kwargs,
         )
     ]

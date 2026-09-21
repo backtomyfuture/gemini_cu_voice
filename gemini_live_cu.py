@@ -89,6 +89,13 @@ class ResumptionHandleExpiredError(ConnectionError):
     pass
 
 
+class GoAwayReconnectError(ConnectionError):
+    """服务端下发 GoAway 信令触发的平滑快速重连异常"""
+    def __init__(self, time_left: Optional[str] = None):
+        super().__init__(f"Server issued GoAway signal (time_left={time_left})")
+        self.time_left = time_left
+
+
 STATE_LISTENING = "LISTENING"  # 空闲听用户说话
 STATE_THINKING = "THINKING"    # 用户已说完，正在等待 Gemini 思考/下发动作
 STATE_EXECUTING = "EXECUTING"  # kimi-cu 工具正在物理执行中
@@ -97,7 +104,7 @@ STATE_SPEAKING = "SPEAKING"    # 扬声器正在平滑播报中
 
 class TurnController:
     """集中式轮次生命周期控制器，管理单调递增 turn_id、当前取消令牌、后台工具任务、播放结束隔离与会话状态"""
-    def __init__(self, use_interaction_status: bool = False):
+    def __init__(self, use_interaction_status: bool = False, policy_manager: Optional[Any] = None):
         self.current_turn_id: int = 0
         self.cancellation_token: CancellationToken = CancellationToken("turn_0")
         self.active_tool_task: Optional[asyncio.Task] = None
@@ -108,6 +115,7 @@ class TurnController:
         self.state: str = STATE_LISTENING
         self.state_start_time: float = time.time()
         self.use_interaction_status = use_interaction_status
+        self.policy_manager = policy_manager
 
     def set_state(self, new_state: str):
         """唯一的会话状态迁移入口；状态与进入时刻都集中在此"""
@@ -117,13 +125,15 @@ class TurnController:
             log_event("STATE", f"Transitioned to {new_state}")
 
     def new_turn(self, reason: str = "new_turn") -> int:
-        """开启新轮次：递增 turn_id，生成全新有效 CancellationToken，取消可能残余的工具任务"""
+        """开启新轮次：递增 turn_id，生成全新有效 CancellationToken，取消可能残余的工具任务，按指令轮次重置策略预算"""
         self.current_turn_id += 1
         self._cancel_tool_tasks()
         self.cancellation_token = CancellationToken(f"turn_{self.current_turn_id}_{time.time():.3f}")
         self.has_active_tool = False
         self.waiting_tool_summary = False
         self.is_interrupted = False
+        if self.policy_manager:
+            self.policy_manager.reset_turn()
         return self.current_turn_id
 
     def _cancel_tool_tasks(self):
@@ -438,6 +448,11 @@ def launch_mac_app(app_name: str, bundle_id: str = "") -> str:
     name_map = {
         "计算器": "Calculator",
         "备忘录": "Notes",
+        "时钟": "Clock",
+        "计时器": "Clock",
+        "闹钟": "Clock",
+        "秒表": "Clock",
+        "clock": "Clock",
         "日历": "Calendar",
         "地图": "Maps",
         "音乐": "Music",
@@ -460,14 +475,30 @@ def launch_mac_app(app_name: str, bundle_id: str = "") -> str:
         "chrome": "Google Chrome",
         "google chrome": "Google Chrome",
         "谷歌浏览器": "Google Chrome",
+        "safari": "Safari",
+        "discord": "Discord",
+        "keynote": "Keynote",
+        "pages": "Pages",
+        "numbers": "Numbers",
+        "文本编辑": "TextEdit",
+        "活动监视器": "Activity Monitor",
+        "系统信息": "System Information",
         "qq": "QQ",
         "腾讯qq": "QQ",
+        "cursor": "Cursor",
+        "obsidian": "Obsidian",
+        "libreoffice": "LibreOffice",
     }
     bid_map = {
         "calculator": "com.apple.calculator",
         "计算器": "com.apple.calculator",
         "notes": "com.apple.Notes",
         "备忘录": "com.apple.Notes",
+        "clock": "com.apple.clock",
+        "时钟": "com.apple.clock",
+        "计时器": "com.apple.clock",
+        "闹钟": "com.apple.clock",
+        "秒表": "com.apple.clock",
         "safari": "com.apple.Safari",
         "chrome": "com.google.Chrome",
         "google chrome": "com.google.Chrome",
@@ -486,6 +517,15 @@ def launch_mac_app(app_name: str, bundle_id: str = "") -> str:
         "microsoft outlook": "com.microsoft.Outlook",
         "word": "com.microsoft.Word",
         "microsoft word": "com.microsoft.Word",
+        "discord": "com.hnc.Discord",
+        "keynote": "com.apple.iWork.Keynote",
+        "pages": "com.apple.iWork.Pages",
+        "numbers": "com.apple.iWork.Numbers",
+        "textedit": "com.apple.TextEdit",
+        "文本编辑": "com.apple.TextEdit",
+        "cursor": "com.todesktop.230313mzl4w4u92",
+        "obsidian": "md.obsidian",
+        "libreoffice": "org.libreoffice.script",
     }
 
     target_bid = bundle_id or bid_map.get(app_name.lower())
@@ -518,14 +558,59 @@ def launch_mac_app(app_name: str, bundle_id: str = "") -> str:
     return f"未能打开应用 '{app_name}': {res.stderr or res2.stderr or '未找到对应应用程序'}"
 
 
-BROWSER_TOOLS = {
-    "browser_open",
-    "browser_search",
-    "browser_get_content",
-    "browser_list_actions",
-    "browser_click",
-    "browser_scroll",
-}
+BROWSER_TOOLS = {decl.name for decl in get_browser_function_declarations()}
+
+CUSTOM_ASR_VOCABULARY = [
+    "长鑫科技", "IT之家", "kimi-cu", "Safari", "Chrome", "Google Chrome",
+    "计算器", "备忘录", "访达", "Finder", "微信", "终端", "Terminal",
+    "百度", "哔哩哔哩", "Ego Lite", "音量", "窗口", "标签页",
+]
+
+
+def build_gemini_function_declarations(
+    mcp_tools: List[Any],
+    is_extended_thinking: bool = False,
+) -> List[types.FunctionDeclaration]:
+    """
+    根据 Gemini 3.8 官方规范构建 FunctionDeclaration 并显式声明 behavior:
+    - Extended Thinking 模型：官方强制要求所有工具必须为 behavior="NON_BLOCKING"
+    - 3.8-live 极速模型：macOS 桌面物理操作与浏览器交互显式声明 behavior="BLOCKING"，保证严格串行
+    """
+    target_behavior = (
+        types.Behavior.NON_BLOCKING if is_extended_thinking else types.Behavior.BLOCKING
+    )
+    gemini_functions = [
+        types.FunctionDeclaration(
+            name=t.name,
+            description=t.description or "",
+            parameters=t.input_schema or {"type": "object", "properties": {}},
+            behavior=target_behavior,
+        )
+        for t in mcp_tools
+    ]
+
+    open_app_tool = types.FunctionDeclaration(
+        name="open_app",
+        description="在 macOS 上启动或前台激活任何应用程序（例如 计算器, 备忘录, 音乐, 微信, Safari, Chrome, 日历等）。如果应用未运行会自动启动，若已在运行则直接置顶激活到前台。用户说'打开XXX'时优先使用此工具。",
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "应用程序名称，支持中文或英文，例如 '计算器', 'Calculator', '备忘录', 'Notes', 'Safari', '微信' 等"
+                },
+                "bundle_id": {
+                    "type": "string",
+                    "description": "可选。应用的 Bundle Identifier，例如 'com.apple.calculator', 'com.apple.Safari' 等"
+                }
+            },
+            "required": ["name"]
+        },
+        behavior=target_behavior,
+    )
+    gemini_functions.append(open_app_tool)
+    gemini_functions.extend(get_browser_function_declarations(behavior=target_behavior.value))
+    return gemini_functions
 
 
 class ToolExecutor:
@@ -674,7 +759,27 @@ class ToolExecutor:
         )
 
     async def _kimi_cu(self, func_name: str, func_args: Dict[str, Any]) -> ToolResultContract:
-        mcp_res = await self.mcp_session.call_tool(func_name, func_args)
+        try:
+            mcp_res = await asyncio.wait_for(
+                self.mcp_session.call_tool(func_name, func_args),
+                timeout=12.0
+            )
+        except asyncio.TimeoutError:
+            return ToolResultContract(
+                ok=False,
+                action=func_name,
+                status="error",
+                summary=f"{func_name} 执行超时 (12秒无响应)",
+                error=f"kimi-cu 工具 {func_name} 执行超时，目标控件可能未就绪或未找到",
+            )
+        except Exception as err:
+            return ToolResultContract(
+                ok=False,
+                action=func_name,
+                status="error",
+                summary=f"{func_name} 执行异常",
+                error=str(err),
+            )
         is_err = bool(getattr(mcp_res, "is_error", False) or getattr(mcp_res, "isError", False))
         texts = []
         for item in mcp_res.content:
@@ -718,8 +823,23 @@ MODEL_THINKING = "gemini-3.8-live-extended-thinking"
 SYSTEM_INSTRUCTION = """
 【重要：绝对语言约束（HIGHEST PRIORITY）】：
 1. 你必须无条件、始终使用清晰流利的【中文】与用户进行全流程交流！
-2. 严禁用英文开场或打招呼！首次打招呼必须使用中文（例如：“您好！我是您的 macOS 实时语音电脑管家，请问有什么可以帮您？”）。
+2. 严禁用英文或其它外语开场或打招呼！首次打招呼必须使用中文（例如：“您好！我是您的 macOS 实时语音电脑管家，请问有什么可以帮您？”）。
 3. 无论用户当前使用什么语言输入、无论网页和工具返回什么语言，你的口语回复、思考总结、状态反馈必须全部使用纯正自然的中文！
+
+【普通话语音识别对齐与领域纠错规则（CRITICAL FOR SPEECH RECOGNITION）】：
+1. 用户输入为中文普通话实时语音流。在声学与语义解码时，必须强制结合科技、macOS 桌面操作与互联网资讯语境进行纠偏，绝对严禁出现跨语言幻觉（严禁输出印地语、梵文、法语、西班牙语等无关外语）！
+2. 常见易混淆科技、桌面专有名词与日常口语严格对照表（结合发音、声调与上下文精准对齐）：
+   - “我让你帮我搜” / “让你帮我搜” / “请帮我搜”（绝对不可误听或脑补为“玩你帮我搜”！）。
+   - “打开了吗” / “打开了么”（绝对不可误听为“打卡吗”或“考勤打卡”！）。
+   - “十月一号” / “10月1号”（绝对不可丢失开头“十”或“10”而误听为“是一号”！）。
+   - “长鑫科技” / “长信科技” / “长江存储” / “中芯国际” 等半导体与科技公司（发音常有送气音 ch/zh，绝对不可误听或脑补为“朱朝阳日记”、“朝阳日记”等非科技词汇！）。
+   - “浏览器”（Ego Lite 浏览器、Safari、Chrome 等，发音为 liú lǎn qì，绝对不可误听为“暖气”！）。
+   - “IT之家”（中国知名科技数码资讯网站 ithome.com，发音为 IT zhī jiā，绝对不可误听为“IT职教”或其它学校！）。
+   - “计算器”（发音 jì suàn qì，不可误听为“光盘录”或“计时器”）。
+   - “Discord”（流行通讯软件，不可误听为“disc code”）。
+   - “Outlook” / “邮箱” / “邮件”。
+   - “模型” / “大模型” / “AI模型”（发音 mó xíng，绝对不可误听为“魔鬼”！）。
+3. 遇到发音微弱、送气音轻或同音字时，强制结合当前桌面操作上下文推断为用户真实意图或桌面软件名称。
 
 【核心身份与上下文记忆原则】：
 1. 你具备跨轮次的上下文记忆能力！你能够清晰记住用户在前面各轮说过的指令、参数、偏好以及上一步打开的应用与网页。
@@ -730,22 +850,23 @@ SYSTEM_INSTRUCTION = """
 
 【工具能力与使用规则】：
 1. 应用程序管理（macOS 本地）：
-   - open_app: 打开或前台激活任意应用程序（计算器、备忘录、微信、QQ、Outlook、Word、音乐、Pages 等）。用户要求“打开XXX软件”时必须优先调用此工具！
+   - open_app: 打开或前台激活任意应用程序（计算器、时钟/计时器、备忘录、微信、QQ、Outlook、Word、音乐、Pages 等）。用户要求“打开XXX软件”时必须优先调用此工具！
    - list_apps: 查看当前正在运行的所有应用程序（包含 name, bundle_id, pid）。操作前可用此工具确认目标应用是否在运行。
    - get_app_state: 获取指定桌面应用的窗口控件树（参数 app 传 bundle_id，mode 建议使用 'ax' 获取极速控件树）。
    - click: 点击目标桌面应用的控件（传 app 和控件 index，或点击坐标 x, y）。
-   - type_text: 向目标应用输入文本（支持 clear=True 清空后输入，submit=True 按回车提交）。
+   - type_text: 向目标应用输入文本（优先传 index 获得焦点，支持 clear=True 清空后输入，submit=True 按回车提交。若要使用 x, y 坐标，必须先调用 get_app_state 获取截图）。
    - press_key: 向应用发送按键或快捷键（如 return, enter, escape, cmd+c, cmd+v, cmd+w, cmd+n 等，参数 app 传 bundle_id）。
    - scroll: 滚动桌面应用窗口。
 
 2. 网页浏览与联网搜索（基于 Ego Lite 极速浏览器）：
    - browser_open: 打开指定网址或 URL，返回网页标题与精简正文（如 browser_open(url="https://www.ithome.com")）。
-   - browser_search: 在浏览器中搜索关键词并提炼要点（如 browser_search(query="特斯拉 Roadster 最新售价")）。
+   - browser_search: 在浏览器中搜索关键词并提炼要点（如 browser_search(query="长鑫科技 最新报道")）。
    - browser_get_content: 抓取当前已打开网页的正文内容并总结。
    - browser_list_actions: 列出当前网页中所有可交互操作元素（链接、按钮）及稳定编号 [#ID]。当页面选项较多或可能出现重复文案误点击时，先调用此工具列出候选编号！
    - browser_click: 在当前网页中点击指定链接或按钮（支持传入候选编号如 "#1" 或标题文字）。
    - browser_scroll: 在当前网页中向上或向下滚动（如 browser_scroll(direction="down")）。
-   【重要原则】：所有网页访问、互联网资讯搜索、网页内容阅读一律优先使用 browser_* 系列工具！当用户要求“看网页/打开某网站”时，直接使用 browser_open，绝不需要多此一举去调用 open_app("Google Chrome")。
+   【出行预订与指定日期页面纪律】：当用户查询特定日期（如“10月1日”、“国庆节”、“明天”等）的机票、酒店、火车票时，若直接打开链接，必须核对页面当前显示的出发日期是否与用户要求严格一致！如果页面停留为默认日期（如今天），必须调用 browser_list_actions 找到日期选项并点击目标日期，或调用 browser_search(query="天津到西安机票 10月1日 价格 携程") 直接查询，绝不可对未切中日期的页面谎称已查好！
+   【绝对纪律】：严禁擅自打开 Safari 或 Google Chrome！所有网页访问、互联网资讯搜索、网页内容阅读一律必须且只能在 Ego Lite 浏览器（通过 browser_* 系列工具）中完成。若在当前网页中未找到目标，调用 browser_search 或 browser_scroll 继续寻找，绝对不允许调用 open_app("Safari")！
 
 【安全防护与执行纪律】：
 1. 涉及永久删除文件、系统关机、恶意脚本执行等高危命令一律被安全策略拦截；
@@ -765,31 +886,65 @@ MIC_RATE = 16000     # 录音采样率 (16kHz, int16 单声道)
 SPK_RATE = 24000     # 播音采样率 (24kHz, int16 单声道)
 CHUNK_SIZE = 1024    # 64ms 块
 
-def find_audio_devices(preferred_mic="Wireless Mic Rx"):
-    """智能查找麦克风，自动检测支持的通道数"""
+def find_audio_devices(preferred_mic=None):
+    """
+    智能查找麦克风：
+    1. 若显式指定了 preferred_mic，优先按关键词搜索指定设备；
+    2. 若系统检测到高品质无线领夹麦 (Wireless Mic Rx)，默认首选以获得最优近场拾音效果；
+    3. 若未连接无线麦，则自动回退至 macOS 系统当前活跃的默认输入设备 (sd.default.device[0])；
+    4. 自动探测并返回最优声道数（单声道或双声道）。
+    """
     devices = sd.query_devices()
     mic_idx = None
     mic_name = "系统默认麦克风"
     channels = 1
 
-    for idx, d in enumerate(devices):
-        if d.get("max_input_channels", 0) > 0:
-            if preferred_mic.lower() in d.get("name", "").lower():
+    # 1. 优先匹配用户显式指定的麦克风
+    if preferred_mic and str(preferred_mic).strip():
+        pref = str(preferred_mic).strip().lower()
+        for idx, d in enumerate(devices):
+            if d.get("max_input_channels", 0) > 0:
+                if pref in d.get("name", "").lower():
+                    mic_idx = idx
+                    mic_name = d["name"]
+                    channels = min(2, d.get("max_input_channels", 1))
+                    break
+
+    # 2. 默认高优先级：若检测到已连接的高品质无线领夹麦 (Wireless Mic)，优先使用以保障专业级近场音质
+    if mic_idx is None:
+        for idx, d in enumerate(devices):
+            if d.get("max_input_channels", 0) > 0 and "wireless mic" in d.get("name", "").lower():
+                mic_idx = idx
+                mic_name = d["name"]
+                channels = min(2, d.get("max_input_channels", 1))
+                break
+
+    # 3. 未检测到无线麦时，回退使用 macOS 当前默认输入设备 (sd.default.device[0])
+    if mic_idx is None:
+        try:
+            default_in = sd.default.device[0]
+            if default_in is not None and default_in >= 0 and default_in < len(devices):
+                d = devices[default_in]
+                if d.get("max_input_channels", 0) > 0:
+                    mic_idx = default_in
+                    mic_name = d["name"]
+                    channels = min(2, d.get("max_input_channels", 1))
+        except Exception:
+            pass
+
+    # 3. 若系统默认设备不可用，回退选取首个可用输入设备
+    if mic_idx is None:
+        for idx, d in enumerate(devices):
+            if d.get("max_input_channels", 0) > 0:
                 mic_idx = idx
                 mic_name = d["name"]
                 channels = min(2, d.get("max_input_channels", 1))
                 break
 
     if mic_idx is None:
-        default_in = sd.default.device[0]
-        if default_in is not None and default_in >= 0:
-            mic_idx = default_in
-            mic_name = devices[default_in]["name"]
-            channels = min(2, devices[default_in].get("max_input_channels", 1))
-        else:
-            mic_idx = 0
-            mic_name = devices[0]["name"]
-            channels = min(2, devices[0].get("max_input_channels", 1))
+        mic_idx = 0
+        mic_name = devices[0]["name"] if devices else "默认麦克风"
+        channels = 1
 
     return mic_idx, mic_name, channels
 
@@ -900,6 +1055,7 @@ async def run_session(
     shutdown_event,
     memory: ConversationMemory,
     user_threshold=None,
+    user_interrupt_threshold=None,
     strict_policy=True,
     session_state=None
 ):
@@ -913,13 +1069,15 @@ async def run_session(
     """
     client = genai.Client(api_key=api_key)
     policy_manager = ToolPolicyManager(strict_mode=strict_policy)
+    policy_manager.reset_turn()
 
     if session_state is None:
         session_state = {"handle": None}
 
     thinking_config = None
     if "thinking" in selected_model:
-        thinking_config = types.ThinkingConfig(include_thoughts=True)
+        level = os.environ.get("GEMINI_THINKING_LEVEL", "low").lower()
+        thinking_config = types.ThinkingConfig(include_thoughts=True, thinking_level=level)
 
     last_resumption_handle = session_state.get("handle")
     session_resumption_cfg = (
@@ -927,8 +1085,19 @@ async def run_session(
         if last_resumption_handle
         else types.SessionResumptionConfig()
     )
+    target_tokens = int(os.environ.get("CONTEXT_TARGET_TOKENS", 32000))
     context_compression_cfg = types.ContextWindowCompressionConfig(
-        sliding_window=types.SlidingWindow(target_tokens=4000)
+        sliding_window=types.SlidingWindow(target_tokens=target_tokens)
+    )
+
+    realtime_input_cfg = types.RealtimeInputConfig(
+        automatic_activity_detection=types.AutomaticActivityDetection(
+            silence_duration_ms=1000,
+            prefix_padding_ms=100,
+            start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+            end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+        ),
+        activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
     )
 
     config = types.LiveConnectConfig(
@@ -943,12 +1112,15 @@ async def run_session(
                 )
             )
         ),
-        input_audio_transcription=types.AudioTranscriptionConfig(),
+        input_audio_transcription=types.AudioTranscriptionConfig(
+            custom_vocabulary=CUSTOM_ASR_VOCABULARY
+        ),
         output_audio_transcription=types.AudioTranscriptionConfig(),
         thinking_config=thinking_config,
         tools=[types.Tool(function_declarations=gemini_functions)],
         session_resumption=session_resumption_cfg,
         context_window_compression=context_compression_cfg,
+        realtime_input_config=realtime_input_cfg,
     )
 
     loop = asyncio.get_running_loop()
@@ -956,16 +1128,25 @@ async def run_session(
     audio_turn_queue = AudioTurnQueue(maxsize=250)
     reconnect_event = asyncio.Event()
 
-    # 近场降噪门限参数 (初始基准值，稍后自适应对齐)
-    START_THRESHOLD = user_threshold or 110
-    HOLD_THRESHOLD = 50
-    ATTACK_FRAMES = 2
-    SILENCE_CHUNKS = 10
-    INTERRUPT_RMS = 220
-    MIN_PEAK_RMS = 95
+    # 近场降噪门限参数 (针对 Wireless Mic 专业领夹麦进行高灵敏起呼，杜绝任何开头漏字)
+    START_THRESHOLD = user_threshold or 65
+    HOLD_THRESHOLD = max(30, min(45, int(START_THRESHOLD * 0.45)))
+    ATTACK_FRAMES = 1  # 1 帧检测即响应，配合 1280ms 前滚缓冲确保首字辅音 100% 完整推入
+    SILENCE_CHUNKS = 13  # 约 832 毫秒断句窗口，与服务端 1000ms 自动 VAD 形成快慢双通道 Hybrid VAD
+    MIN_PEAK_RMS = max(80, int(START_THRESHOLD * 1.2))
 
-    pre_roll = collections.deque(maxlen=4)
+    # 分级打断门限 (Barge-in Threshold Hierarchy)
+    # 1. 播报打断门限 (需近场清晰发声，拦截扬声器漏音误打断；尾音阶段自动回落)
+    INTERRUPT_SPEAKING_RMS = user_interrupt_threshold or max(260, int(START_THRESHOLD * 2.8))
+    # 2. 动作执行打断门限 (高代价桌面物理操作，提升打断门槛，需近场明确喊停)
+    INTERRUPT_EXECUTING_RMS = max(380, int(START_THRESHOLD * 3.5)) if not user_interrupt_threshold else max(int(user_interrupt_threshold * 1.25), 380)
+    # 3. 思考打断门限 (Gemini 思考时扬声器静音，近场开口即打断，杜绝吞字)
+    INTERRUPT_THINKING_RMS = max(160, int(START_THRESHOLD * 2.0)) if not user_interrupt_threshold else max(user_interrupt_threshold, 160)
+
+    pre_roll = collections.deque(maxlen=20)  # 约 1280ms 常驻滚动前滚缓冲，100% 留存整句话前摇、吸气声与首字辅音
     is_speaking = False
+    speech_frames = 0
+    speech_end_time = 0.0
     attack_count = 0
     silence_count = 0
     interrupt_frames = 0
@@ -973,17 +1154,21 @@ async def run_session(
     calib_samples = []
     last_cli_print_time = 0.0
 
-    turn_ctrl = TurnController(use_interaction_status="thinking" in selected_model)
+    turn_ctrl = TurnController(
+        use_interaction_status="thinking" in selected_model,
+        policy_manager=policy_manager
+    )
     tool_executor = ToolExecutor(mcp_session=mcp_session)
     send_lock = asyncio.Lock()
 
-    def handle_voice_barge_in(reason: str, initial_chunk: Optional[bytes] = None):
-        """在事件循环主线程中线程安全地处理打断、清理队列与开启新轮次"""
+    def handle_voice_barge_in(reason: str, initial_chunks: Optional[List[bytes]] = None):
+        """在事件循环主线程中线程安全地处理打断、清理队列与开启新轮次，完整注入打断前摇音频"""
         turn_ctrl.interrupt(reason)
         audio_turn_queue.discard_turn()
         turn_ctrl.new_turn(f"speech_after_{reason}")
-        if initial_chunk:
-            audio_turn_queue.enqueue_audio(initial_chunk)
+        if initial_chunks:
+            for chunk in initial_chunks:
+                audio_turn_queue.enqueue_audio(chunk)
 
     def handle_voice_speech_start(chunks_to_send: list):
         """在事件循环主线程中线程安全地开启新轮次并推送起呼前摇音频"""
@@ -992,30 +1177,30 @@ async def run_session(
             audio_turn_queue.enqueue_audio(pr_chunk)
 
     def mic_callback(indata, frames, time_info, status):
-        nonlocal is_speaking, attack_count, silence_count, interrupt_frames
-        nonlocal START_THRESHOLD, HOLD_THRESHOLD, MIN_PEAK_RMS, INTERRUPT_RMS
+        nonlocal is_speaking, speech_frames, speech_end_time, attack_count, silence_count, interrupt_frames
+        nonlocal START_THRESHOLD, HOLD_THRESHOLD, MIN_PEAK_RMS
+        nonlocal INTERRUPT_SPEAKING_RMS, INTERRUPT_EXECUTING_RMS, INTERRUPT_THINKING_RMS
         nonlocal last_cli_print_time
 
         if mic_channels == 2:
             stereo = np.frombuffer(indata, dtype=np.int16).reshape(-1, 2)
-            ch0 = stereo[:, 0]
-            ch1 = stereo[:, 1]
-            rms0 = int(np.sqrt(np.mean(ch0.astype(np.float32)**2)))
-            rms1 = int(np.sqrt(np.mean(ch1.astype(np.float32)**2)))
-            if rms0 > rms1 * 1.8 and rms0 > 25:
-                mono_samples = ch0
-                rms = rms0
-            elif rms1 > rms0 * 1.8 and rms1 > 25:
-                mono_samples = ch1
-                rms = rms1
-            else:
-                mono_samples = ((ch0.astype(np.int32) + ch1.astype(np.int32)) // 2).astype(np.int16)
-                rms = max(rms0, rms1)
-            raw_bytes = mono_samples.tobytes()
+            # 关键：Wireless Mic Rx 为专业双通道硬件，固定提取 Channel 0 主声道，彻底根除逐帧跳切带来的波形抖动
+            mono_samples = stereo[:, 0]
         else:
             mono_samples = np.frombuffer(indata, dtype=np.int16)
-            rms = int(np.sqrt(np.mean(mono_samples.astype(np.float32)**2)))
-            raw_bytes = bytes(indata)
+
+        # 硬件直流偏移去除 (DC Offset Removal)：消除 -6.95 的固定硬件偏置，保留纯净自然的声学基频
+        mono_f = mono_samples.astype(np.float32)
+        offset = float(np.mean(mono_f))
+        if abs(offset) > 0.5:
+            mono_f = mono_f - offset
+            mono_samples = np.clip(mono_f, -32767, 32767).astype(np.int16)
+
+        rms = int(np.sqrt(np.mean(mono_f**2)))
+        raw_bytes = mono_samples.tobytes()
+
+        # 关键机制：无条件持续向滚动前摇缓冲压入新鲜帧，确保任何时刻起呼或打断均能无损获取 1280ms 前摇
+        pre_roll.append(raw_bytes)
 
         if not is_ready_to_listen:
             calib_samples.append(rms)
@@ -1025,98 +1210,116 @@ async def run_session(
         should_print_cli = (now - last_cli_print_time >= 0.1)
         bars = "▇" * min(12, rms // 30) + "░" * max(0, 12 - rms // 30)
 
-        # 1. 扬声器播报中：检测打断
+        # 1. 扬声器播报中：检测打断 (需近场明确发声达到 INTERRUPT_SPEAKING_RMS 且持续2帧，彻底拦截扬声器回音自激)
         if turn_ctrl.state == STATE_SPEAKING:
-            if rms >= INTERRUPT_RMS:
+            if rms >= INTERRUPT_SPEAKING_RMS:
                 interrupt_frames += 1
                 if interrupt_frames >= 2:
                     player.interrupt()
-                    loop.call_soon_threadsafe(handle_voice_barge_in, "speaking", raw_bytes)
+                    chunks = list(pre_roll)
+                    loop.call_soon_threadsafe(handle_voice_barge_in, "speaking", chunks)
                     is_speaking = True
+                    speech_frames = 1
                     attack_count = 0
                     silence_count = 0
                     interrupt_frames = 0
-                    log_event("USER_INTERRUPT", f"User interrupted speaking (rms={rms})")
+                    log_event("USER_INTERRUPT", f"User interrupted speaking (rms={rms}, threshold={INTERRUPT_SPEAKING_RMS})")
                     sys.stdout.write(f"\r🛑 [\033[1;31m已打断播报，请继续说...\033[0m]                           \n")
                     sys.stdout.flush()
                     last_cli_print_time = now
+                    return
             else:
                 interrupt_frames = 0
             if should_print_cli:
-                sys.stdout.write(f"\r🗣️ [\033[1;35mGemini 正在播报...\033[0m] 音量: |{bars}| ({rms:3d}) ")
+                sys.stdout.write(f"\r🗣️ [\033[1;35mGemini 正在播报...\033[0m] 音量: |{bars}| ({rms:3d}/{INTERRUPT_SPEAKING_RMS}) ")
                 sys.stdout.flush()
                 last_cli_print_time = now
             return
 
-        # 2. kimi-cu 正在执行动作：检测到强力打断停止后续动作
+        # 2. kimi-cu 正在执行动作：物理桌面操作打断门槛极高，非近场大声明确喊话不中断
         if turn_ctrl.state == STATE_EXECUTING:
-            if rms >= INTERRUPT_RMS:
+            if rms >= INTERRUPT_EXECUTING_RMS:
                 interrupt_frames += 1
                 if interrupt_frames >= 3:
                     player.interrupt()
-                    loop.call_soon_threadsafe(handle_voice_barge_in, "executing", raw_bytes)
+                    chunks = list(pre_roll)
+                    loop.call_soon_threadsafe(handle_voice_barge_in, "executing", chunks)
                     is_speaking = True
+                    speech_frames = 1
                     attack_count = 0
                     silence_count = 0
                     interrupt_frames = 0
-                    log_event("USER_INTERRUPT", f"User interrupted executing state (rms={rms})")
+                    log_event("USER_INTERRUPT", f"User interrupted executing state (rms={rms}, threshold={INTERRUPT_EXECUTING_RMS})")
                     sys.stdout.write(f"\r🛑 [\033[1;31m已打断动作执行，请继续说...\033[0m]                           \n")
                     sys.stdout.flush()
                     last_cli_print_time = now
+                    return
             else:
                 interrupt_frames = 0
             if should_print_cli:
-                sys.stdout.write(f"\r⚙️ [\033[1;33mkimi-cu 正在执行桌面动作...\033[0m] 音量: |{bars}| ({rms:3d}) ")
+                sys.stdout.write(f"\r⚙️ [\033[1;33mkimi-cu 正在执行桌面动作...\033[0m] 音量: |{bars}| ({rms:3d}/{INTERRUPT_EXECUTING_RMS}) ")
                 sys.stdout.flush()
                 last_cli_print_time = now
             return
 
-        # 3. 正在思考中
+        # 3. 正在思考中 (支持气口续说自然合并；真正打断需达 INTERRUPT_THINKING_RMS 且持续2帧，杜绝微小环境杂音误打断)
         if turn_ctrl.state == STATE_THINKING:
-            if rms >= max(260, int(START_THRESHOLD * 1.8)):
-                interrupt_frames += 1
-                if interrupt_frames >= 3:
-                    player.interrupt()
-                    loop.call_soon_threadsafe(handle_voice_barge_in, "thinking", raw_bytes)
+            time_since_speech_end = now - speech_end_time
+            if time_since_speech_end < 0.85 and not turn_ctrl.has_active_tool and not player.is_busy():
+                if rms >= START_THRESHOLD:
+                    # 视为同一轮长句的气口自然续接，直接切回 LISTENING，追加音频流，绝不清空队列
+                    loop.call_soon_threadsafe(turn_ctrl.set_state, STATE_LISTENING)
                     is_speaking = True
-                    attack_count = 0
                     silence_count = 0
-                    interrupt_frames = 0
-                    log_event("USER_INTERRUPT", f"User interrupted thinking state (rms={rms})")
-                    sys.stdout.write(f"\r🛑 [\033[1;31m已取消等待，请重新说...\033[0m]                           \n")
-                    sys.stdout.flush()
-                    last_cli_print_time = now
+                    speech_frames += 1
+                    log_event("SPEECH_CONTINUE", f"Merged speech continuation during thinking (rms={rms}, gap={time_since_speech_end:.2f}s)")
+                    chunks = list(pre_roll)
+                    for c in chunks[-4:]:
+                        loop.call_soon_threadsafe(audio_turn_queue.enqueue_audio, c)
+                    return
             else:
-                interrupt_frames = 0
+                if rms >= INTERRUPT_THINKING_RMS:
+                    interrupt_frames += 1
+                    if interrupt_frames >= 2:
+                        player.interrupt()
+                        chunks = list(pre_roll)
+                        loop.call_soon_threadsafe(handle_voice_barge_in, "thinking", chunks)
+                        is_speaking = True
+                        speech_frames = 1
+                        attack_count = 0
+                        silence_count = 0
+                        interrupt_frames = 0
+                        log_event("USER_INTERRUPT", f"User spoke during thinking, transitioned to new speech (rms={rms}, threshold={INTERRUPT_THINKING_RMS})")
+                        sys.stdout.write(f"\r🎤 [\033[1;32m检测到打断并重新说话，实时响应中...\033[0m]                           \n")
+                        sys.stdout.flush()
+                        last_cli_print_time = now
+                        return
+                else:
+                    interrupt_frames = 0
+
             if should_print_cli:
-                sys.stdout.write(f"\r🧠 [\033[1;36mGemini 正在处理中...\033[0m] 音量: |{bars}| ({rms:3d}) ")
+                sys.stdout.write(f"\r🧠 [\033[1;36mGemini 正在处理中...\033[0m] 音量: |{bars}| ({rms:3d}/{INTERRUPT_THINKING_RMS}) ")
                 sys.stdout.flush()
                 last_cli_print_time = now
             return
 
-        # 4. 空闲监听中 (HybridVAD 连续流式输入)
+        # 4. 空闲监听中 (HybridVAD 连续流式输入，零延迟极速响应 + 1280ms 全量前摇推送)
         if not is_speaking:
             if rms >= START_THRESHOLD:
-                attack_count += 1
-                pre_roll.append(raw_bytes)
-                if should_print_cli or attack_count == 1:
-                    sys.stdout.write(f"\r🎤 [\033[1;33m检测到声音 {attack_count}/{ATTACK_FRAMES}\033[0m] 音量: |{bars}| ({rms:3d}/{START_THRESHOLD}) ")
+                is_speaking = True
+                speech_frames = 1
+                silence_count = 0
+                attack_count = 0
+                chunks_to_send = list(pre_roll)
+                loop.call_soon_threadsafe(handle_voice_speech_start, chunks_to_send)
+                log_event("USER_SPEECH_START", f"Streaming speech started (rms={rms})")
+                if should_print_cli:
+                    sys.stdout.write(f"\r🎤 [\033[1;32m正在流式说话\033[0m] 音量: |{bars}| ({rms:3d}) ")
                     sys.stdout.flush()
                     last_cli_print_time = now
-
-                if attack_count >= ATTACK_FRAMES:
-                    is_speaking = True
-                    silence_count = 0
-                    attack_count = 0
-                    chunks_to_send = list(pre_roll)
-                    pre_roll.clear()
-                    loop.call_soon_threadsafe(handle_voice_speech_start, chunks_to_send)
-                    log_event("USER_SPEECH_START", f"Streaming speech started (rms={rms})")
             else:
-                attack_count = 0
-                pre_roll.append(raw_bytes)
                 if should_print_cli:
-                    if rms >= max(35, int(START_THRESHOLD * 0.55)):
+                    if rms >= max(35, int(START_THRESHOLD * 0.6)):
                         sys.stdout.write(f"\r🎤 [\033[93m收音中\033[0m] 音量: |{bars}| ({rms:3d}/{START_THRESHOLD}) ")
                     else:
                         sys.stdout.write(f"\r🎤 [\033[90m监听中\033[0m] 音量: |{bars}| ({rms:3d}/{START_THRESHOLD}) ")
@@ -1124,6 +1327,7 @@ async def run_session(
                     last_cli_print_time = now
         else:
             # 持续流式推送 PCM 块
+            speech_frames += 1
             loop.call_soon_threadsafe(audio_turn_queue.enqueue_audio, raw_bytes)
             if rms >= HOLD_THRESHOLD:
                 silence_count = 0
@@ -1133,15 +1337,19 @@ async def run_session(
                     last_cli_print_time = now
             else:
                 silence_count += 1
+                # 动态断句容忍：刚起呼阶段（发声小于 20 帧约 1.2 秒），轻微放宽停顿容忍到 16 帧（约 1.0 秒，快于服务端兜底）
+                required_silence = 16 if speech_frames < 20 else SILENCE_CHUNKS
                 if should_print_cli:
-                    sys.stdout.write(f"\r🎤 [\033[1;36m检测停顿 {silence_count}/{SILENCE_CHUNKS}\033[0m] 音量: |{bars}| ({rms:3d}) ")
+                    sys.stdout.write(f"\r🎤 [\033[1;36m检测停顿 {silence_count}/{required_silence}\033[0m] 音量: |{bars}| ({rms:3d}) ")
                     sys.stdout.flush()
                     last_cli_print_time = now
 
-                if silence_count >= SILENCE_CHUNKS:
+                if silence_count >= required_silence:
                     is_speaking = False
                     silence_count = 0
                     attack_count = 0
+                    speech_frames = 0
+                    speech_end_time = now
                     # 发送音频流结束标记，通知 Gemini 即刻开始响应
                     loop.call_soon_threadsafe(audio_turn_queue.finish_turn)
                     loop.call_soon_threadsafe(turn_ctrl.set_state, STATE_THINKING)
@@ -1183,7 +1391,7 @@ async def run_session(
             )
             mic_stream.start()
 
-            # 现场底噪自适应校准
+            # 现场底噪自适应校准 (建立近场防御网，避免安静环境下门限跌破安全值导致旁人闲聊打断)
             await asyncio.sleep(1.2)
             if not user_threshold and calib_samples:
                 warm_samples = calib_samples[5:] if len(calib_samples) > 8 else calib_samples
@@ -1191,20 +1399,58 @@ async def run_session(
                 noise_p75 = int(np.percentile(warm_samples, 75))
                 noise_mean = int(np.mean(warm_samples))
                 base_noise = noise_p75
-                START_THRESHOLD = max(65, min(160, int(base_noise * 1.7 + 25)))
-                HOLD_THRESHOLD = max(35, min(90, int(base_noise * 1.1 + 10)))
-                MIN_PEAK_RMS = max(75, int(START_THRESHOLD * 1.15))
-                INTERRUPT_RMS = max(160, int(START_THRESHOLD * 1.7))
-                log_event("CALIBRATION", f"Noise floor median={noise_median}, mean={noise_mean}, p75={noise_p75}, start_threshold={START_THRESHOLD}, hold_threshold={HOLD_THRESHOLD}, min_peak={MIN_PEAK_RMS}")
+                # 近场起呼门限：适配高保真近场领夹麦，保持 55~85 极速灵敏响应，绝不漏吞开头轻辅音
+                START_THRESHOLD = max(55, min(85, int(base_noise * 1.25 + 12)))
+                HOLD_THRESHOLD = max(30, min(45, int(START_THRESHOLD * 0.45)))
+                MIN_PEAK_RMS = max(80, int(START_THRESHOLD * 1.2))
+
+                if not user_interrupt_threshold:
+                    INTERRUPT_SPEAKING_RMS = max(260, int(START_THRESHOLD * 2.8))
+                    INTERRUPT_EXECUTING_RMS = max(380, int(START_THRESHOLD * 3.5))
+                    INTERRUPT_THINKING_RMS = max(160, int(START_THRESHOLD * 2.0))
+                else:
+                    INTERRUPT_SPEAKING_RMS = user_interrupt_threshold
+                    INTERRUPT_EXECUTING_RMS = max(int(user_interrupt_threshold * 1.25), 380)
+                    INTERRUPT_THINKING_RMS = max(user_interrupt_threshold, 160)
+
+                log_event("CALIBRATION", f"Noise floor median={noise_median}, mean={noise_mean}, p75={noise_p75}, start_threshold={START_THRESHOLD}, hold_threshold={HOLD_THRESHOLD}, min_peak={MIN_PEAK_RMS}, interrupt_speaking={INTERRUPT_SPEAKING_RMS}, interrupt_executing={INTERRUPT_EXECUTING_RMS}, interrupt_thinking={INTERRUPT_THINKING_RMS}")
 
             is_ready_to_listen = True
-            sys.stdout.write(f"\r🟢 [\033[1;32m连接就绪，请直接对麦克风说话\033[0m] (起呼门限: {START_THRESHOLD}, 维持门限: {HOLD_THRESHOLD})                 \n")
+            sys.stdout.write(f"\r🟢 [\033[1;32m连接就绪，请直接对麦克风说话\033[0m] (起呼门限: {START_THRESHOLD}, 维持门限: {HOLD_THRESHOLD}, 打断门限: 播报{INTERRUPT_SPEAKING_RMS}/执行{INTERRUPT_EXECUTING_RMS})                 \n")
             sys.stdout.flush()
 
-            # 看门狗：仅在真正彻底失联时触发重连，不误杀正常动作
+            # 看门狗：纯思考等待超时（12.0s无应答）平滑恢复就绪；失联超长超时（60s）触发重连
             async def watchdog_loop():
                 while not shutdown_event.is_set() and not reconnect_event.is_set():
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.5)
+                    # 1. 快速恢复：纯语音等待回复超时（12.0秒服务端无输出，自动退回 LISTENING 避免假死卡住）
+                    if (
+                        turn_ctrl.state == STATE_THINKING
+                        and not turn_ctrl.has_active_tool
+                        and not turn_ctrl.waiting_tool_summary
+                        and not player.is_busy()
+                    ):
+                        idle_sec = time.time() - turn_ctrl.state_start_time
+                        if idle_sec > 12.0:
+                            log_event("THINKING_TIMEOUT_RECOVER", f"Server silent for {idle_sec:.1f}s, auto-recovering to LISTENING")
+                            turn_ctrl.set_state(STATE_LISTENING)
+                            sys.stdout.write(f"\r🟢 [\033[1;32m连接就绪，请直接对麦克风说话\033[0m] (起呼门限: {START_THRESHOLD})                 \n")
+                            sys.stdout.flush()
+
+                    # 1.5 孤儿执行态快速自愈：若处于 EXECUTING 状态但已无任何活动的后台工具任务，1.5 秒内自动退回 LISTENING
+                    if (
+                        turn_ctrl.state == STATE_EXECUTING
+                        and not turn_ctrl.has_active_tool
+                        and not player.is_busy()
+                    ):
+                        idle_sec = time.time() - turn_ctrl.state_start_time
+                        if idle_sec > 1.5:
+                            log_event("EXECUTING_ORPHAN_RECOVER", f"No active tool running while in EXECUTING for {idle_sec:.1f}s, auto-recovering to LISTENING")
+                            turn_ctrl.set_state(STATE_LISTENING)
+                            sys.stdout.write(f"\r🟢 [\033[1;32m连接就绪，请直接对麦克风说话\033[0m] (起呼门限: {START_THRESHOLD})                 \n")
+                            sys.stdout.flush()
+
+                    # 2. 彻底失联重连看门狗
                     if turn_ctrl.state in [STATE_THINKING, STATE_EXECUTING] and not player.is_busy():
                         idle_sec = time.time() - turn_ctrl.state_start_time
                         if idle_sec > 60.0:
@@ -1243,7 +1489,12 @@ async def run_session(
             async def execute_tools_task(target_turn_id: int, tool_call: Any, token: CancellationToken):
                 current_task = asyncio.current_task()
                 try:
-                    if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
+                    if not turn_ctrl.is_current_turn(target_turn_id):
+                        log_event("TOOL_CANCELLED_SKIP", f"Tools task dropped: turn {target_turn_id} is stale (current is {turn_ctrl.current_turn_id})")
+                        return
+
+                    if token.is_cancelled:
+                        log_event("TOOL_TOKEN_CANCELLED", f"Tools task cancelled: reason={token.cancel_reason}, turn={target_turn_id}")
                         return
                     function_responses = []
                     for call in tool_call.function_calls:
@@ -1305,14 +1556,19 @@ async def run_session(
                     log_event("TOOL_TASK_ERROR", f"Error in execute_tools_task: {e}")
                 finally:
                     turn_ctrl.finish_active_tool(target_turn_id, current_task)
+                    if turn_ctrl.is_current_turn(target_turn_id) and turn_ctrl.state == STATE_EXECUTING and not turn_ctrl.has_active_tool:
+                        # 兜底保障：若所有工具任务均已退出且仍处于 EXECUTING 状态，自动回落至 LISTENING，杜绝假死卡住
+                        log_event("TOOL_STATE_RECOVER", f"All active tool tasks ended for turn {target_turn_id}, recovering state from EXECUTING to LISTENING")
+                        turn_ctrl.set_state(STATE_LISTENING)
+                        sys.stdout.write(f"\r🟢 [\033[1;32m动作执行已结束，请直接对麦克风说话\033[0m]                                      \n")
+                        sys.stdout.flush()
 
             # 接收循环：常驻监听，使用公开 session.receive() 迭代器
             async def recv_loop():
-                nonlocal current_user_transcript, current_model_transcript, current_tools_executed
+                nonlocal current_user_transcript, current_model_transcript, current_tools_executed, go_away_time_left
 
                 try:
                     while not shutdown_event.is_set() and not reconnect_event.is_set():
-                        policy_manager.reset_turn()
                         messages_in_turn = 0
 
                         async for response in session.receive():
@@ -1329,7 +1585,9 @@ async def run_session(
 
                             # 0.1 检查服务端 GoAway 通知 (平滑重连)
                             if getattr(response, "go_away", None):
-                                log_event("SERVER_GO_AWAY", "Server issued GoAway signal, graceful reconnect triggered")
+                                time_left = getattr(response.go_away, "time_left", None)
+                                log_event("SERVER_GO_AWAY", f"Server issued GoAway signal (time_left={time_left}), initiating instant reconnect")
+                                go_away_time_left = time_left or "unspecified"
                                 reconnect_event.set()
                                 break
 
@@ -1337,12 +1595,22 @@ async def run_session(
                             if getattr(response, "tool_call_cancellation", None) and response.tool_call_cancellation.ids:
                                 cancelled_ids = set(response.tool_call_cancellation.ids)
                                 log_event("SERVER_TOOL_CANCEL", f"Server cancelled tool call IDs: {cancelled_ids}")
-                                turn_ctrl.interrupt("Server cancelled tool call")
+                                if turn_ctrl.state in [STATE_EXECUTING, STATE_THINKING]:
+                                    turn_ctrl.interrupt("Server cancelled tool call")
 
-                            # 1. 检查服务端打断信号
+                            # 0.3 检查与记录配额使用量统计 (Usage Metadata)
+                            if getattr(response, "usage_metadata", None):
+                                u = response.usage_metadata
+                                log_event(
+                                    "USAGE_METADATA",
+                                    f"Tokens: total={u.total_token_count}, prompt={u.prompt_token_count}, response={u.response_token_count}"
+                                )
+
+                            # 1. 检查服务端打断信号 (仅在客户端正处于播报态时才打断轮次，绝不误杀客户端已开辟的新轮次Token)
                             if response.server_content and response.server_content.interrupted:
                                 player.interrupt()
-                                turn_ctrl.interrupt("Server reported interrupted")
+                                if turn_ctrl.state == STATE_SPEAKING:
+                                    turn_ctrl.interrupt("Server reported interrupted")
                                 log_event("SERVER_INTERRUPT", "Server reported interrupted")
 
                             # 1.5 语音实时转录展示与收集
@@ -1361,6 +1629,8 @@ async def run_session(
                                         log_event("MODEL_TRANSCRIPT", txt)
                                         sys.stdout.write(f"\n🤖 [\033[1;36mGemini 播报转录\033[0m] {txt}\n")
                                         sys.stdout.flush()
+                                if getattr(response.server_content, "generation_complete", False):
+                                    log_event("SERVER_GENERATION_COMPLETE", "Server generation completed")
 
                             # 2. 模型回复内容（思考、文本与音频）
                             if response.server_content and response.server_content.model_turn:
@@ -1412,8 +1682,7 @@ async def run_session(
                                     async def wait_for_playback_done(target_turn_id: int):
                                         wait_start = time.time()
                                         while player.is_busy() and (time.time() - wait_start < 15.0):
-                                            await asyncio.sleep(0.05)
-                                        await asyncio.sleep(0.1)
+                                            await asyncio.sleep(0.03)
                                         # 隔离保护：仅当仍属于当前轮次且未被打断时，才切换为 LISTENING
                                         if not turn_ctrl.is_current_turn(target_turn_id) or turn_ctrl.cancellation_token.is_cancelled:
                                             log_event("DISCARD_OLD_TURN_CALLBACK", f"Turn {target_turn_id} playback callback discarded (current turn is {turn_ctrl.current_turn_id})")
@@ -1440,6 +1709,7 @@ async def run_session(
             current_user_transcript = []
             current_model_transcript = []
             current_tools_executed = []
+            go_away_time_left = None
 
             task_send = asyncio.create_task(send_loop())
             task_recv = asyncio.create_task(recv_loop())
@@ -1452,7 +1722,8 @@ async def run_session(
                 task_send.cancel()
                 task_recv.cancel()
                 task_watchdog.cancel()
-                turn_ctrl._cancel_tool_tasks()
+                if go_away_time_left is None:
+                    turn_ctrl._cancel_tool_tasks()
                 try:
                     mic_stream.stop()
                     mic_stream.close()
@@ -1460,6 +1731,17 @@ async def run_session(
                     pass
 
             if reconnect_event.is_set():
+                if go_away_time_left is not None:
+                    if turn_ctrl.has_active_tool:
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.shield(asyncio.gather(*list(turn_ctrl.active_tool_tasks), return_exceptions=True)),
+                                timeout=1.5
+                            )
+                        except Exception:
+                            pass
+                    turn_ctrl._cancel_tool_tasks()
+                    raise GoAwayReconnectError(time_left=go_away_time_left)
                 raise ConnectionError("Live 连接断开或触发平滑重连 (reconnect_event)")
     except asyncio.CancelledError:
         raise
@@ -1487,14 +1769,20 @@ async def main():
     parser.add_argument(
         "--mic",
         type=str,
-        default=os.environ.get("PREFER_MIC", "Wireless Mic Rx"),
-        help="指定优先使用的麦克风名称（默认: Wireless Mic Rx）"
+        default=os.environ.get("PREFER_MIC", ""),
+        help="指定优先使用的麦克风名称（留空则自动选用 macOS 系统当前默认麦克风）"
     )
     parser.add_argument(
         "--threshold",
         type=int,
         default=int(os.environ.get("MIC_THRESHOLD", 0)) or None,
-        help="近场说话起呼门限 RMS（默认自动根据底噪自适应，通常 80~150）"
+        help="近场说话起呼门限 RMS（默认自动根据底噪自适应，通常 140~260，防旁人闲聊误触发）"
+    )
+    parser.add_argument(
+        "--interrupt-threshold",
+        type=int,
+        default=int(os.environ.get("INTERRUPT_THRESHOLD", 0)) or None,
+        help="打断门限 RMS（默认根据起呼门限及状态分级自适应计算，通常 350~480）"
     )
     parser.add_argument(
         "--voice",
@@ -1519,16 +1807,18 @@ async def main():
     mic_idx, mic_name, mic_channels = find_audio_devices(args.mic)
     kimi_cu_path = os.environ.get("KIMI_CU_PATH", "/Applications/KimiCU.app/Contents/MacOS/kimi-cu")
 
-    log_event("STARTUP", f"Starting service with model={selected_model}, mic={mic_name} (ch={mic_channels}), threshold={args.threshold}, voice={args.voice}")
+    log_event("STARTUP", f"Starting service with model={selected_model}, mic={mic_name} (ch={mic_channels}), threshold={args.threshold}, interrupt_threshold={args.interrupt_threshold}, voice={args.voice}")
 
     print("=" * 68)
     print("🎙️   Gemini 3.8 Live + kimi-cu 全双工长效记忆语音电脑管家")
     print(f"🤖  当前模型: \033[1;36m{selected_model}\033[0m")
     print(f"🎤  输入麦克风: \033[1;32m[{mic_idx}] {mic_name} ({mic_channels}通道)\033[0m")
     if args.threshold:
-        print(f"🎯  降噪门限: \033[1;33m固定近场门限 RMS={args.threshold}\033[0m (拦截远场闲聊与环境杂音)")
+        print(f"🎯  降噪门限: \033[1;33m固定近场起呼门限 RMS={args.threshold}\033[0m (拦截远场闲聊与环境杂音)")
     else:
-        print(f"🎯  降噪门限: \033[1;32m智能自适应近场门控\033[0m (开机自动采样底噪对齐)")
+        print(f"🎯  降噪门限: \033[1;32m智能自适应近场门控\033[0m (开机自动采样底噪对齐，防旁人闲聊误触发)")
+    if args.interrupt_threshold:
+        print(f"🛑  打断门限: \033[1;33m固定打断门限 RMS={args.interrupt_threshold}\033[0m (防旁人闲聊误打断)")
     print(f"🗣️  当前音色: \033[1;35m{args.voice}\033[0m (可选: Aoede, Puck, Charon, Kore, Fenrir)")
     print(f"🧠  上下文记忆: \033[1;32m常驻长连接 + 本地记忆池自动回灌 (全流程无缝连贯)\033[0m")
     print(f"🛡️  安全策略: \033[1;32m{'严格拦截高危与注入指令' if not args.non_strict else '宽松告警模式'}\033[0m")
@@ -1572,36 +1862,10 @@ async def main():
                 await mcp_session.initialize()
                 tools_resp = await mcp_session.list_tools()
 
-                gemini_functions = [
-                    types.FunctionDeclaration(
-                        name=t.name,
-                        description=t.description or "",
-                        parameters=t.input_schema or {"type": "object", "properties": {}}
-                    )
-                    for t in tools_resp.tools
-                ]
-
-                # 注入 macOS 原生应用启动工具
-                open_app_tool = types.FunctionDeclaration(
-                    name="open_app",
-                    description="在 macOS 上启动或前台激活任何应用程序（例如 计算器, 备忘录, 音乐, 微信, Safari, Chrome, 日历等）。如果应用未运行会自动启动，若已在运行则直接置顶激活到前台。用户说'打开XXX'时优先使用此工具。",
-                    parameters={
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "应用程序名称，支持中文或英文，例如 '计算器', 'Calculator', '备忘录', 'Notes', 'Safari', '微信' 等"
-                            },
-                            "bundle_id": {
-                                "type": "string",
-                                "description": "可选。应用的 Bundle Identifier，例如 'com.apple.calculator', 'com.apple.Safari' 等"
-                            }
-                        },
-                        "required": ["name"]
-                    }
+                gemini_functions = build_gemini_function_declarations(
+                    tools_resp.tools,
+                    is_extended_thinking="thinking" in selected_model
                 )
-                gemini_functions.append(open_app_tool)
-                gemini_functions.extend(get_browser_function_declarations())
 
                 tool_names = [t.name for t in gemini_functions]
                 print(f"✅ 成功加载 {len(gemini_functions)} 个 macOS 原生桌面与浏览器控制工具:")
@@ -1627,12 +1891,19 @@ async def main():
                             shutdown_event=shutdown_event,
                             memory=conversation_memory,
                             user_threshold=args.threshold,
+                            user_interrupt_threshold=args.interrupt_threshold,
                             strict_policy=not args.non_strict,
                             session_state=session_state
                         )
                         retry_count = 0
                     except asyncio.CancelledError:
                         break
+                    except GoAwayReconnectError as e:
+                        # 服务端计划内 GoAway 调度：立即平滑重连，不增加重试退避延迟，保留官方 Session Resumption Handle
+                        log_event("GOAWAY_INSTANT_RECONNECT", f"Smoothly reconnecting following GoAway: {e}")
+                        print(f"\n🔄 [服务端平滑调度 (GoAway)，立即无缝重连并恢复会话...]", file=sys.stderr)
+                        retry_count = 0
+                        await asyncio.sleep(0.05)
                     except ResumptionHandleExpiredError as e:
                         retry_count += 1
                         # 仅在携带 handle 建连握手失败时清空 handle 并降级为本地记忆回灌
@@ -1642,7 +1913,7 @@ async def main():
                         await asyncio.sleep(0.5)
                     except Exception as e:
                         retry_count += 1
-                        # 正常网络断线或服务端 GoAway：保留 session_state["handle"] 供下一次重连尝试恢复
+                        # 正常网络断线或异常断开：保留 session_state["handle"] 供下一次重连尝试恢复
                         jitter = random.uniform(0.2, 0.8)
                         wait_sec = min(30.0, (1.8 ** min(retry_count, 5)) + jitter)
                         log_event("RECONNECT", f"Connection dropped (attempt {retry_count}): {e}, retrying in {wait_sec:.1f}s")
