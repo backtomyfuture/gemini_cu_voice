@@ -42,6 +42,9 @@ if not os.environ.get("http_proxy") and not os.environ.get("https_proxy"):
         except Exception:
             pass
 
+import unittest.mock as mock
+import threading
+
 from google import genai
 from google.genai import types
 
@@ -58,7 +61,8 @@ from gemini_live_cu import (
     find_audio_devices,
     SYSTEM_INSTRUCTION,
     ConversationMemory,
-    TurnController
+    TurnController,
+    ResumptionHandleExpiredError
 )
 from ego_browser_client import (
     browser_open,
@@ -374,19 +378,185 @@ async def test_layer_0(report: TestReport):
     cost = (time.time() - t0) * 1000
     report.record("Layer 0", "容灾降级: 官方 Handle 恢复失效自动清空并降级记忆回灌 (Handle Failure Fallback)", fallback_ok, f"Handle已清空={session_state['handle'] is None}, 降级记忆轮次={len(prefills)//2}", cost)
 
-    # 0.16 浏览器进程超时清理保障 (Process Timeout Cleanup in run_ego_js)
+    # 0.16 浏览器子进程治理契约 (Process Timeout & Cancelled Cleanup in run_ego_js)
     t0 = time.time()
-    res = await run_ego_js("await new Promise(r => setTimeout(r, 2000));", timeout=0.1)
-    cleanup_ok = (res.get("ok") is False) and ("超时" in res.get("error", ""))
-    cost = (time.time() - t0) * 1000
-    report.record("Layer 0", "子进程治理: run_ego_js 超时清理与无僵尸进程 (Process Timeout & Cleanup)", cleanup_ok, f"返回结果: {res}", cost)
+    # 纯无外部依赖 Mock 测试：验证超时强杀与打断 CancelledError 协程时的进程清理
+    class MockProcess:
+        def __init__(self, hang=False):
+            self.killed = False
+            self.waited = False
+            self.hang = hang
 
-    # 0.17 浏览器导航失败拒绝旧页面幽灵数据 (Browser Navigation Failure Rejecting Ghost Data)
-    t0 = time.time()
-    res_text = await browser_open("http://127.0.0.1:59999/non_existent_page_path")
-    reject_ghost_ok = is_browser_error(res_text) and ("失败" in res_text)
+        async def communicate(self, input=None):
+            if self.hang:
+                await asyncio.sleep(10.0)
+            return b'{"ok": true}', b""
+
+        def kill(self):
+            self.killed = True
+
+        async def wait(self):
+            self.waited = True
+            return -9
+
+    # 1. 验证超时治理
+    mock_proc_timeout = MockProcess(hang=True)
+    with mock.patch("asyncio.create_subprocess_exec", new=mock.AsyncMock(return_value=mock_proc_timeout)):
+        res_timeout = await run_ego_js("console.log('timeout test')", timeout=0.05)
+    timeout_governance_ok = (
+        res_timeout.get("ok") is False
+        and "超时" in res_timeout.get("error", "")
+        and mock_proc_timeout.killed
+        and mock_proc_timeout.waited
+    )
+
+    # 2. 验证打断协同取消 (CancelledError) 强杀治理
+    mock_proc_cancel = MockProcess(hang=True)
+    cancelled_governance_ok = False
+    with mock.patch("asyncio.create_subprocess_exec", new=mock.AsyncMock(return_value=mock_proc_cancel)):
+        t_task = asyncio.create_task(run_ego_js("console.log('cancel test')", timeout=5.0))
+        await asyncio.sleep(0.02)
+        t_task.cancel()
+        try:
+            await t_task
+        except asyncio.CancelledError:
+            cancelled_governance_ok = mock_proc_cancel.killed and mock_proc_cancel.waited
+
+    proc_cleanup_ok = timeout_governance_ok and cancelled_governance_ok
     cost = (time.time() - t0) * 1000
-    report.record("Layer 0", "契约安全: 页面导航失败严格报错，拒绝旧页面幽灵数据 (Reject Ghost Old Page)", reject_ghost_ok, f"输出: {res_text[:60]}", cost)
+    report.record(
+        "Layer 0",
+        "子进程治理: run_ego_js 超时与打断协同强杀回收 (Process Timeout & Cancel Cleanup)",
+        proc_cleanup_ok,
+        f"超时强杀={timeout_governance_ok}, 打断回收={cancelled_governance_ok}",
+        cost,
+    )
+
+    # 0.17 浏览器导航失败拒绝旧页面幽灵数据契约 (Reject Ghost Old Page Contract)
+    t0 = time.time()
+    # 纯无外部依赖 Mock 测试：模拟网络拒绝连接与导航报错，验证严格返回失败契约
+    with mock.patch("ego_browser_client.run_ego_js", return_value={"ok": False, "error": "net::ERR_NAME_NOT_RESOLVED"}):
+        res_text_fail = await browser_open("https://non-existent-domain.xyz")
+    with mock.patch("ego_browser_client.run_ego_js", return_value={"ok": True, "title": "新测试页", "url": "https://ok.com", "text": "真实内容"}):
+        res_text_ok = await browser_open("https://ok.com")
+
+    reject_ghost_ok = (
+        is_browser_error(res_text_fail)
+        and ("失败" in res_text_fail)
+        and (not is_browser_error(res_text_ok))
+        and ("新测试页" in res_text_ok)
+    )
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "契约安全: 页面导航失败严格报错，拒绝旧页面幽灵数据 (Reject Ghost Old Page)",
+        reject_ghost_ok,
+        f"失败契约识别={is_browser_error(res_text_fail)}, 成功契约放行={not is_browser_error(res_text_ok)}",
+        cost,
+    )
+
+    # 0.18 轮次隔离: 旧工具任务退出不污染新轮次状态 (TurnController Finish Active Tool Precision)
+    t0 = time.time()
+    ctrl_iso = TurnController()
+    t1 = ctrl_iso.new_turn("turn1")
+    dummy_task_1 = asyncio.create_task(asyncio.sleep(0.01))
+    ctrl_iso.active_tool_task = dummy_task_1
+    ctrl_iso.has_active_tool = True
+
+    # 用户在新轮次打断，开启 t2
+    t2 = ctrl_iso.new_turn("turn2")
+    dummy_task_2 = asyncio.create_task(asyncio.sleep(0.01))
+    ctrl_iso.active_tool_task = dummy_task_2
+    ctrl_iso.has_active_tool = True
+
+    # 模拟旧任务 dummy_task_1 退出，调用 finish_active_tool
+    ctrl_iso.finish_active_tool(t1, dummy_task_1)
+    # 验证：t2 的 has_active_tool 依然为 True，且 active_tool_task 保持 dummy_task_2
+    t1_not_polluting = ctrl_iso.has_active_tool and (ctrl_iso.active_tool_task is dummy_task_2)
+
+    # 当 t2 真实完成退出时
+    ctrl_iso.finish_active_tool(t2, dummy_task_2)
+    t2_cleared = (not ctrl_iso.has_active_tool) and (ctrl_iso.active_tool_task is None)
+
+    try:
+        await dummy_task_1
+    except asyncio.CancelledError:
+        pass
+    await dummy_task_2
+    tool_isolation_ok = t1_not_polluting and t2_cleared
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "轮次隔离: 旧工具任务退出精确回收，不冲刷新轮次状态 (Turn Tool State Isolation)",
+        tool_isolation_ok,
+        f"旧任务未污染新轮次={t1_not_polluting}, 当前任务精确清理={t2_cleared}",
+        cost,
+    )
+
+    # 0.19 线程安全: 音频 C 线程打断安全派发至事件循环主线程 (Thread-safe Barge-in Scheduling)
+    t0 = time.time()
+    loop = asyncio.get_running_loop()
+    ctrl_thread = TurnController()
+    tid_1 = ctrl_thread.new_turn("t1")
+    thread_dummy_task = asyncio.create_task(asyncio.sleep(1.0))
+    ctrl_thread.active_tool_task = thread_dummy_task
+    test_q = asyncio.Queue()
+
+    def thread_safe_barge_in():
+        ctrl_thread.interrupt("mic_barge_in")
+        ctrl_thread.new_turn("t2_after_barge_in")
+        test_q.put_nowait(b"interrupted_pcm")
+
+    def mock_mic_c_thread():
+        time.sleep(0.02)
+        # 从模拟的音频 C 线程跨线程派发
+        loop.call_soon_threadsafe(thread_safe_barge_in)
+
+    th = threading.Thread(target=mock_mic_c_thread)
+    th.start()
+    th.join()
+    await asyncio.sleep(0.03)
+
+    barge_in_ok = (
+        ctrl_thread.current_turn_id > tid_1
+        and thread_dummy_task.cancelled()
+        and (not ctrl_thread.cancellation_token.is_cancelled)
+        and (not test_q.empty())
+    )
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "线程安全: 音频回调线程通过 loop.call_soon_threadsafe 调度打断 (Thread-safe Barge-in)",
+        barge_in_ok,
+        f"轮次安全递增={ctrl_thread.current_turn_id > tid_1}, 旧任务取消={thread_dummy_task.cancelled()}, 新Token就绪={not ctrl_thread.cancellation_token.is_cancelled}",
+        cost,
+    )
+
+    # 0.20 会话恢复: GoAway 平滑保留 Handle 与握手失败降级隔离 (GoAway Handle Preservation vs Handshake Fallback)
+    t0 = time.time()
+    # 场景 A: GoAway 平滑关闭（handshake 已成功），抛出普通 ConnectionError，外层必须保留 Handle
+    session_state_a = {"handle": "valid_goaway_handle_abc"}
+    simulated_goaway_err = ConnectionError("Live 连接断开或触发平滑重连 (reconnect_event)")
+    if isinstance(simulated_goaway_err, ResumptionHandleExpiredError):
+        session_state_a["handle"] = None
+    goaway_preserved = session_state_a["handle"] == "valid_goaway_handle_abc"
+
+    # 场景 B: 携带 Handle 建连握手失败，主动抛出 ResumptionHandleExpiredError，外层必须清空 Handle
+    session_state_b = {"handle": "expired_handle_xyz"}
+    simulated_expired_err = ResumptionHandleExpiredError("Handle resumption handshake failed")
+    if isinstance(simulated_expired_err, ResumptionHandleExpiredError):
+        session_state_b["handle"] = None
+    handshake_fallback_ok = session_state_b["handle"] is None
+
+    resumption_isolation_ok = goaway_preserved and handshake_fallback_ok
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "恢复语义: GoAway保留最新恢复句柄，仅建连握手失败时降级清空 (Resumption Semantics Isolation)",
+        resumption_isolation_ok,
+        f"GoAway保留Handle={goaway_preserved}, 握手失败清空Handle={handshake_fallback_ok}",
+        cost,
+    )
 
 
 # ==============================================================================

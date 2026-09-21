@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional, Any, Dict, List, Set, Union
 
 from dotenv import load_dotenv
 from google import genai
@@ -82,6 +83,11 @@ class ConversationMemory:
         return list(self.history)
 
 
+class ResumptionHandleExpiredError(ConnectionError):
+    """当使用上次保存的会话恢复句柄建连握手失败时抛出，指示 handle 已失效需降级为记忆注入"""
+    pass
+
+
 class TurnController:
     """集中式轮次生命周期控制器，管理单调递增 turn_id、当前取消令牌、后台工具任务与播放结束隔离"""
     def __init__(self):
@@ -113,6 +119,14 @@ class TurnController:
             self.active_tool_task = None
         self.has_active_tool = False
         self.waiting_tool_summary = False
+
+    def finish_active_tool(self, turn_id: int, task: Optional[asyncio.Task] = None):
+        """关键修复：仅当轮次与任务对象精确匹配时才清理 has_active_tool，防止旧任务退出冲刷新任务状态"""
+        if self.current_turn_id == turn_id:
+            if task is None or self.active_tool_task is task:
+                self.has_active_tool = False
+                if self.active_tool_task is task:
+                    self.active_tool_task = None
 
     def is_current_turn(self, turn_id: int) -> bool:
         """检查指定 turn_id 是否仍为当前最新轮次（用于丢弃迟到的旧轮次回调）"""
@@ -696,6 +710,20 @@ async def run_session(
             except Exception:
                 break
 
+    def handle_voice_barge_in(reason: str, initial_chunk: Optional[bytes] = None):
+        """在事件循环主线程中线程安全地处理打断、清理队列与开启新轮次"""
+        turn_ctrl.interrupt(reason)
+        drain_audio_queue()
+        turn_ctrl.new_turn(f"speech_after_{reason}")
+        if initial_chunk:
+            safe_put_audio(initial_chunk)
+
+    def handle_voice_speech_start(chunks_to_send: list):
+        """在事件循环主线程中线程安全地开启新轮次并推送起呼前摇音频"""
+        turn_ctrl.new_turn("speech_start")
+        for pr_chunk in chunks_to_send:
+            safe_put_audio(pr_chunk)
+
     def mic_callback(indata, frames, time_info, status):
         nonlocal is_speaking, attack_count, silence_count, state, interrupt_frames
         nonlocal START_THRESHOLD, HOLD_THRESHOLD, MIN_PEAK_RMS, INTERRUPT_RMS
@@ -735,16 +763,12 @@ async def run_session(
             if rms >= INTERRUPT_RMS:
                 interrupt_frames += 1
                 if interrupt_frames >= 2:
-                    turn_ctrl.interrupt("User interrupted during speaking")
                     player.interrupt()
-                    loop.call_soon_threadsafe(drain_audio_queue)
+                    loop.call_soon_threadsafe(handle_voice_barge_in, "speaking", raw_bytes)
                     set_state(STATE_LISTENING)
                     is_speaking = True
                     attack_count = 0
                     silence_count = 0
-                    # 关键修复：打断后立刻为随后说的话开启全新轮次与有效 CancellationToken
-                    turn_ctrl.new_turn("speech_after_interrupt_speaking")
-                    loop.call_soon_threadsafe(safe_put_audio, raw_bytes)
                     log_event("USER_INTERRUPT", f"User interrupted speaking (rms={rms})")
                     sys.stdout.write(f"\r🛑 [\033[1;31m已打断播报，请继续说...\033[0m]                           \n")
                     sys.stdout.flush()
@@ -762,15 +786,12 @@ async def run_session(
             if rms >= INTERRUPT_RMS:
                 interrupt_frames += 1
                 if interrupt_frames >= 3:
-                    turn_ctrl.interrupt("User voice interrupt during tool execution")
                     player.interrupt()
-                    loop.call_soon_threadsafe(drain_audio_queue)
+                    loop.call_soon_threadsafe(handle_voice_barge_in, "executing", raw_bytes)
                     set_state(STATE_LISTENING)
                     is_speaking = True
                     attack_count = 0
                     silence_count = 0
-                    turn_ctrl.new_turn("speech_after_interrupt_executing")
-                    loop.call_soon_threadsafe(safe_put_audio, raw_bytes)
                     log_event("USER_INTERRUPT", f"User interrupted executing state (rms={rms})")
                     sys.stdout.write(f"\r🛑 [\033[1;31m已打断动作执行，请继续说...\033[0m]                           \n")
                     sys.stdout.flush()
@@ -788,15 +809,12 @@ async def run_session(
             if rms >= max(260, int(START_THRESHOLD * 1.8)):
                 interrupt_frames += 1
                 if interrupt_frames >= 3:
-                    turn_ctrl.interrupt("User voice interrupt during thinking")
                     player.interrupt()
-                    loop.call_soon_threadsafe(drain_audio_queue)
+                    loop.call_soon_threadsafe(handle_voice_barge_in, "thinking", raw_bytes)
                     set_state(STATE_LISTENING)
                     is_speaking = True
                     attack_count = 0
                     silence_count = 0
-                    turn_ctrl.new_turn("speech_after_interrupt_thinking")
-                    loop.call_soon_threadsafe(safe_put_audio, raw_bytes)
                     log_event("USER_INTERRUPT", f"User interrupted thinking state (rms={rms})")
                     sys.stdout.write(f"\r🛑 [\033[1;31m已取消等待，请重新说...\033[0m]                           \n")
                     sys.stdout.flush()
@@ -823,10 +841,9 @@ async def run_session(
                     is_speaking = True
                     silence_count = 0
                     attack_count = 0
-                    turn_ctrl.new_turn("speech_start")
-                    for pr_chunk in pre_roll:
-                        loop.call_soon_threadsafe(safe_put_audio, pr_chunk)
+                    chunks_to_send = list(pre_roll)
                     pre_roll.clear()
+                    loop.call_soon_threadsafe(handle_voice_speech_start, chunks_to_send)
                     log_event("USER_SPEECH_START", f"Streaming speech started (rms={rms})")
             else:
                 attack_count = 0
@@ -867,23 +884,27 @@ async def run_session(
                     last_cli_print_time = now
 
     # 建立全双工连接（常驻连接）
-    async with client.aio.live.connect(model=selected_model, config=config) as session:
-        log_event("SESSION", f"Gemini Live session connected ({selected_model})")
+    handshake_done = False
+    try:
+        async with client.aio.live.connect(model=selected_model, config=config) as session:
+            log_event("SESSION", f"Gemini Live session connected ({selected_model})")
 
-        # 核心：如果已有上下文记忆且未由 handle 自动恢复，自动回灌前序轮次
-        prefill_turns = memory.get_prefill_turns()
-        if prefill_turns and not last_resumption_handle:
-            try:
-                await session.send_client_content(turns=prefill_turns, turn_complete=False)
-                log_event("MEMORY_INJECTED", f"Successfully prefilled {len(prefill_turns)} history turns into session")
-                sys.stdout.write(f"\r🧠 [\033[1;36m已恢复前序 {len(prefill_turns)//2} 轮上下文对话记忆\033[0m]                       \n")
+            # 核心：如果已有上下文记忆且未由 handle 自动恢复，自动回灌前序轮次
+            prefill_turns = memory.get_prefill_turns()
+            if prefill_turns and not last_resumption_handle:
+                try:
+                    await session.send_client_content(turns=prefill_turns, turn_complete=False)
+                    log_event("MEMORY_INJECTED", f"Successfully prefilled {len(prefill_turns)} history turns into session")
+                    sys.stdout.write(f"\r🧠 [\033[1;36m已恢复前序 {len(prefill_turns)//2} 轮上下文对话记忆\033[0m]                       \n")
+                    sys.stdout.flush()
+                except Exception as e:
+                    log_event("MEMORY_INJECT_FAIL", f"Failed to prefill history: {e}")
+            elif last_resumption_handle:
+                log_event("SESSION_RESUMED", f"Resumed session with handle {last_resumption_handle[:16]}...")
+                sys.stdout.write(f"\r⚡ [\033[1;36m已通过官方 Handle 无缝恢复 Live 会话\033[0m]                       \n")
                 sys.stdout.flush()
-            except Exception as e:
-                log_event("MEMORY_INJECT_FAIL", f"Failed to prefill history: {e}")
-        elif last_resumption_handle:
-            log_event("SESSION_RESUMED", f"Resumed session with handle {last_resumption_handle[:16]}...")
-            sys.stdout.write(f"\r⚡ [\033[1;36m已通过官方 Handle 无缝恢复 Live 会话\033[0m]                       \n")
-            sys.stdout.flush()
+
+            handshake_done = True
 
         mic_stream = sd.RawInputStream(
             samplerate=MIC_RATE,
@@ -953,10 +974,11 @@ async def run_session(
 
         # 异步工具执行任务：在独立后台任务中执行，完全不阻塞 recv_loop 接收打断信令
         async def execute_tools_task(target_turn_id: int, tool_call: Any, token: CancellationToken):
-            if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
-                return
-            function_responses = []
+            current_task = asyncio.current_task()
             try:
+                if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
+                    return
+                function_responses = []
                 for call in tool_call.function_calls:
                     if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
                         break
@@ -997,7 +1019,7 @@ async def run_session(
                         if func_name == "open_app":
                             target_app = func_args.get("name", "") or func_args.get("app", "")
                             target_bid = func_args.get("bundle_id", "")
-                            raw_text = launch_mac_app(target_app, target_bid)
+                            raw_text = await asyncio.to_thread(launch_mac_app, target_app, target_bid)
                             contract = ToolResultContract(
                                 ok="成功" in raw_text,
                                 action="open_app",
@@ -1131,15 +1153,15 @@ async def run_session(
                     async with send_lock:
                         await session.send_tool_response(function_responses=function_responses)
                     log_event("TOOL_RESPONSE_SENT", f"Sent response for {len(function_responses)} calls, waiting for Gemini summary")
-                    turn_ctrl.has_active_tool = False
-                    turn_ctrl.waiting_tool_summary = True
-                    set_state(STATE_THINKING)
+                    if turn_ctrl.is_current_turn(target_turn_id):
+                        turn_ctrl.waiting_tool_summary = True
+                        set_state(STATE_THINKING)
             except asyncio.CancelledError:
                 log_event("TOOL_TASK_CANCELLED", f"Active tool task cancelled for turn {target_turn_id}")
-                turn_ctrl.has_active_tool = False
             except Exception as e:
                 log_event("TOOL_TASK_ERROR", f"Error in execute_tools_task: {e}")
-                turn_ctrl.has_active_tool = False
+            finally:
+                turn_ctrl.finish_active_tool(target_turn_id, current_task)
 
         # 接收循环：常驻监听，使用公开 session.receive() 迭代器
         async def recv_loop():
@@ -1298,6 +1320,12 @@ async def run_session(
 
         if reconnect_event.is_set():
             raise ConnectionError("Live 连接断开或触发平滑重连 (reconnect_event)")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        if last_resumption_handle and not handshake_done:
+            raise ResumptionHandleExpiredError(f"Failed to resume session with handle {last_resumption_handle[:16]}...: {e}") from e
+        raise
 
 
 async def main():
@@ -1464,18 +1492,20 @@ async def main():
                         retry_count = 0
                     except asyncio.CancelledError:
                         break
+                    except ResumptionHandleExpiredError as e:
+                        retry_count += 1
+                        # 仅在携带 handle 建连握手失败时清空 handle 并降级为本地记忆回灌
+                        log_event("RESUME_FAILED_FALLBACK", f"Session resume with handle failed: {e}. Clearing handle and falling back to memory injection.")
+                        print("\n⚠️ [官方会话句柄已失效，自动清空 Handle 并降级为本地上下文记忆回灌...]", file=sys.stderr)
+                        session_state["handle"] = None
+                        await asyncio.sleep(0.5)
                     except Exception as e:
                         retry_count += 1
-                        # 关键修复：当持有 handle 重连失败时，说明服务端会话 handle 已失效，清空 handle 降级为本地上下文记忆回灌
-                        if session_state.get("handle"):
-                            log_event("RESUME_FAILED_FALLBACK", f"Session resume with handle failed: {e}. Clearing handle and falling back to memory injection.")
-                            print("\n⚠️ [官方会话句柄恢复失败，自动清空 Handle 并降级为本地上下文记忆回灌...]", file=sys.stderr)
-                            session_state["handle"] = None
-
+                        # 正常网络断线或服务端 GoAway：保留 session_state["handle"] 供下一次重连尝试恢复
                         jitter = random.uniform(0.2, 0.8)
                         wait_sec = min(30.0, (1.8 ** min(retry_count, 5)) + jitter)
                         log_event("RECONNECT", f"Connection dropped (attempt {retry_count}): {e}, retrying in {wait_sec:.1f}s")
-                        print(f"\n⚠️ [连接断开，{wait_sec:.1f}s 后自动重连并恢复记忆 (第 {retry_count} 次)]: {e}", file=sys.stderr)
+                        print(f"\n⚠️ [连接断开，{wait_sec:.1f}s 后自动重连并恢复会话 (第 {retry_count} 次)]: {e}", file=sys.stderr)
                         await asyncio.sleep(wait_sec)
 
     except KeyboardInterrupt:

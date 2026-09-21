@@ -32,8 +32,26 @@ def reset_active_tab():
     _CURRENT_ACTIVE_TAB_LABEL = None
 
 
+def build_page_setup_js(preferred_label: Optional[str]) -> str:
+    """生成统一的 taskSpace、tabs 检查与目标 page 获取的 JS 前导代码，杜绝冗余与标签解析漂移"""
+    safe_pref = json.dumps(preferred_label)
+    return f"""const preferredLabel = {safe_pref};
+const task = await taskSpace("voice assistant web");
+const tabs = await task.tabs();
+let activeTab = null;
+if (preferredLabel && tabs && tabs.length > 0) {{
+    activeTab = tabs.find(t => t.label === preferredLabel);
+}}
+if (!activeTab && tabs && tabs.length > 0) {{
+    activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
+}}
+const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
+const currentActiveLabel = (activeTab && activeTab.label) ? activeTab.label : "p1";
+"""
+
+
 async def run_ego_js(js_code: str, timeout: float = 12.0) -> Dict[str, Any]:
-    """通过 ego-browser nodejs 执行自动化脚本并解析 JSON 结果（支持超时强杀子进程，无僵尸进程残留）"""
+    """通过 ego-browser nodejs 执行自动化脚本并解析 JSON 结果（支持超时强杀子进程与打断协同取消，无僵尸进程残留）"""
     clean_code = js_code.strip()
     if not clean_code.startswith("(async () =>") and not clean_code.startswith("(async()=>"):
         clean_code = f"(async () => {{\n{clean_code}\n}})();"
@@ -73,6 +91,15 @@ async def run_ego_js(js_code: str, timeout: float = 12.0) -> Dict[str, Any]:
             except Exception:
                 pass
         return {"ok": False, "error": f"浏览器操作超时 ({timeout}s)"}
+    except asyncio.CancelledError:
+        # 关键修复：当协程被外部打断 cancel 时，显式 kill 并 wait 回收子进程，绝不留存后台僵尸进程
+        if proc:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        raise
     except Exception as e:
         if proc:
             try:
@@ -97,19 +124,8 @@ async def browser_open(url_or_kw: str, max_chars: int = 1200) -> str:
             target = f"https://www.baidu.com/s?wd={query_enc}"
 
     safe_target = json.dumps(target)
-    safe_pref = json.dumps(_CURRENT_ACTIVE_TAB_LABEL)
-    code = f"""const preferredLabel = {safe_pref};
-const task = await taskSpace("voice assistant web");
-const tabs = await task.tabs();
-let activeTab = null;
-if (preferredLabel && tabs && tabs.length > 0) {{
-    activeTab = tabs.find(t => t.label === preferredLabel);
-}}
-if (!activeTab && tabs && tabs.length > 0) {{
-    activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
-}}
-const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
-const currentActiveLabel = (activeTab && activeTab.label) ? activeTab.label : "p1";
+    setup_js = build_page_setup_js(_CURRENT_ACTIVE_TAB_LABEL)
+    code = f"""{setup_js}
 const targetUrl = {safe_target};
 try {{
     await page.goto(targetUrl, {{ waitUntil: "domcontentloaded", timeout: 6500 }});
@@ -172,20 +188,8 @@ async def browser_get_content(max_chars: int = 1800) -> str:
     """
     抓取当前 ego lite 前台最新激活页面的正文内容
     """
-    safe_pref = json.dumps(_CURRENT_ACTIVE_TAB_LABEL)
-    code = f"""const preferredLabel = {safe_pref};
-const task = await taskSpace("voice assistant web");
-const tabs = await task.tabs();
-let activeTab = null;
-if (preferredLabel && tabs && tabs.length > 0) {{
-    activeTab = tabs.find(t => t.label === preferredLabel);
-}}
-if (!activeTab && tabs && tabs.length > 0) {{
-    activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
-}}
-const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
-const currentActiveLabel = (activeTab && activeTab.label) ? activeTab.label : "p1";
-
+    setup_js = build_page_setup_js(_CURRENT_ACTIVE_TAB_LABEL)
+    code = f"""{setup_js}
 const title = await page.title();
 const currentUrl = await page.url();
 const text = await page.evaluate(() => {{
@@ -210,20 +214,8 @@ async def browser_list_actions(max_items: int = 25) -> str:
     获取当前网页中所有可交互操作元素（链接、按钮、输入项）列表及稳定编号 [#ID]
     用于杜绝重复文案导致的模糊误点击，提供高可靠候选确认能力
     """
-    safe_pref = json.dumps(_CURRENT_ACTIVE_TAB_LABEL)
-    code = f"""const preferredLabel = {safe_pref};
-const task = await taskSpace("voice assistant web");
-const tabs = await task.tabs();
-let activeTab = null;
-if (preferredLabel && tabs && tabs.length > 0) {{
-    activeTab = tabs.find(t => t.label === preferredLabel);
-}}
-if (!activeTab && tabs && tabs.length > 0) {{
-    activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
-}}
-const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
-const currentActiveLabel = (activeTab && activeTab.label) ? activeTab.label : "p1";
-
+    setup_js = build_page_setup_js(_CURRENT_ACTIVE_TAB_LABEL)
+    code = f"""{setup_js}
 const title = await page.title();
 const currentUrl = await page.url();
 
@@ -284,22 +276,15 @@ console.log(JSON.stringify({{ ok: true, title, url: currentUrl, items, activeTab
 
 async def browser_click(text_or_selector: str) -> str:
     """
-    在当前页面点击指定文字、选择器或候选编号[#ID]（支持准确 ID 匹配与新标签页自动跟踪）
+    在当前页面点击指定文字、选择器或候选编号[#ID]（支持准确 ID 匹配与精准新标签页自动跟踪）
     """
     target = text_or_selector.strip()
     safe_target = json.dumps(target)
-    safe_pref = json.dumps(_CURRENT_ACTIVE_TAB_LABEL)
-    code = f"""const preferredLabel = {safe_pref};
-const task = await taskSpace("voice assistant web");
-const tabs = await task.tabs();
-let activeTab = null;
-if (preferredLabel && tabs && tabs.length > 0) {{
-    activeTab = tabs.find(t => t.label === preferredLabel);
-}}
-if (!activeTab && tabs && tabs.length > 0) {{
-    activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
-}}
-const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
+    setup_js = build_page_setup_js(_CURRENT_ACTIVE_TAB_LABEL)
+    code = f"""{setup_js}
+// 记录点击前已存在的标签集合，用于精确判断是否弹出了新标签页，杜绝切到无关历史标签
+const beforeTabs = await task.tabs();
+const beforeLabels = new Set((beforeTabs || []).map(t => t.label));
 
 const raw = {safe_target};
 try {{
@@ -375,14 +360,15 @@ try {{
     }}
 
     await page.waitForTimeout(1000);
-    // 检查是否产生了新 Tab
-    const newTabs = await task.tabs();
-    const targetTab = (newTabs && newTabs.length > 0) ? newTabs[newTabs.length - 1] : activeTab;
+    // 关键修复：对比点击前后的标签集合，仅当真正产生新标签页时才切换，杜绝误切到无关已有标签
+    const afterTabs = await task.tabs();
+    const newlyOpenedTab = (afterTabs || []).find(t => !beforeLabels.has(t.label));
+    const targetTab = newlyOpenedTab || activeTab || (afterTabs && afterTabs[0]);
     const targetPage = targetTab && targetTab.label ? task.page(targetTab.label) : page;
     const finalLabel = targetTab && targetTab.label ? targetTab.label : (activeTab && activeTab.label ? activeTab.label : "p1");
     const title = await targetPage.title();
     const url = await targetPage.url();
-    console.log(JSON.stringify({{ ok: true, matchType, title, url, activeTabLabel: finalLabel }}));
+    console.log(JSON.stringify({{ ok: true, matchType, title, url, activeTabLabel: finalLabel, openedNewTab: Boolean(newlyOpenedTab) }}));
 }} catch (e) {{
     console.log(JSON.stringify({{ ok: false, error: String(e) }}));
 }}
@@ -400,20 +386,8 @@ async def browser_scroll(direction: str = "down") -> str:
     在当前网页滚动窗口（自动作用于最新打开的页面或标签页）
     """
     delta = 800 if direction.lower() == "down" else -800
-    safe_pref = json.dumps(_CURRENT_ACTIVE_TAB_LABEL)
-    code = f"""const preferredLabel = {safe_pref};
-const task = await taskSpace("voice assistant web");
-const tabs = await task.tabs();
-let activeTab = null;
-if (preferredLabel && tabs && tabs.length > 0) {{
-    activeTab = tabs.find(t => t.label === preferredLabel);
-}}
-if (!activeTab && tabs && tabs.length > 0) {{
-    activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
-}}
-const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
-const currentActiveLabel = (activeTab && activeTab.label) ? activeTab.label : "p1";
-
+    setup_js = build_page_setup_js(_CURRENT_ACTIVE_TAB_LABEL)
+    code = f"""{setup_js}
 await page.evaluate((d) => window.scrollBy(0, d), {delta});
 await page.waitForTimeout(600);
 console.log(JSON.stringify({{ ok: true, message: "已滚动页面", activeTabLabel: currentActiveLabel }}));
