@@ -44,6 +44,7 @@ from ego_browser_client import (
     browser_list_actions,
     browser_click,
     browser_scroll,
+    browser_close,
     get_browser_function_declarations
 )
 
@@ -648,6 +649,17 @@ class ToolExecutor:
                 summary=res_text[:80],
                 side_effects="ui_updated" if not err else "none",
                 error=res_text if err else None,
+            )
+        if func_name == "browser_close":
+            close_win = func_args.get("close_window", True)
+            res_text = await browser_close(close_window=close_win)
+            return ToolResultContract(
+                ok=True,
+                action="browser_close",
+                status="success",
+                summary="已成功关闭浏览器页面并退出窗口",
+                data=res_text,
+                side_effects="window_closed",
             )
         direction = func_args.get("direction", "down")
         res_text = await browser_scroll(direction)

@@ -97,6 +97,14 @@ WRITE_TOOLS = {
     "scroll",
 }
 
+# 纯界面状态探查工具集合（无副作用，当发生界面写操作后状态会被刷新）
+STATE_INSPECTION_TOOLS = {
+    "list_apps",
+    "get_app_state",
+    "browser_get_content",
+    "browser_list_actions",
+}
+
 # 高危按键组合 (例如批量删除、关闭系统、强制退出等)
 DANGEROUS_KEYS = {
     "cmd+alt+esc",
@@ -221,7 +229,21 @@ class ToolPolicyManager:
         except Exception:
             args_key = str(func_args)
 
-        repeat_count = sum(1 for fn, ak in self.call_history if fn == func_name and ak == args_key)
+        is_inspection = func_name in STATE_INSPECTION_TOOLS
+        if is_inspection:
+            # 状态探查类工具：仅统计自最近一次状态变更（写操作）之后的重复调用次数
+            last_mutating_idx = -1
+            for idx in range(len(self.call_history) - 1, -1, -1):
+                _, _, is_mut = self.call_history[idx]
+                if is_mut:
+                    last_mutating_idx = idx
+                    break
+            sub_history = self.call_history[last_mutating_idx + 1:] if last_mutating_idx != -1 else self.call_history
+            repeat_count = sum(1 for fn, ak, _ in sub_history if fn == func_name and ak == args_key)
+        else:
+            # 改变状态的操作：统计本轮累计调用次数
+            repeat_count = sum(1 for fn, ak, _ in self.call_history if fn == func_name and ak == args_key)
+
         # 搜索、打开网页等非递增幂等操作，单轮内相同参数调用超过 1 次即阻断；点击等操作超过 2 次阻断
         max_allowed = 1 if func_name in ["browser_search", "browser_open", "open_app"] else 2
         if repeat_count >= max_allowed:
@@ -247,7 +269,8 @@ class ToolPolicyManager:
 
         # 5. 放行并记录历史与计数
         self.current_turn_count += 1
-        self.call_history.append((func_name, args_key))
+        is_mutating = func_name not in STATE_INSPECTION_TOOLS
+        self.call_history.append((func_name, args_key, is_mutating))
         return True, ToolResultContract(
             ok=True,
             action=func_name,

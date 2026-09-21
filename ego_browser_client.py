@@ -6,13 +6,27 @@ import asyncio
 import json
 import re
 import shutil
+import time
 import urllib.parse
 from typing import Dict, Any, List, Optional
 
 EGO_BROWSER_BIN = shutil.which("ego-browser") or "/Users/jarod/.local/bin/ego-browser"
 
-# 全局活跃标签页追踪，确保跨工具调用操作同一页面，防止多标签漂移
+# 全局活跃标签页与独立 TaskSpace 追踪
 _CURRENT_ACTIVE_TAB_LABEL: Optional[str] = None
+_CURRENT_SPACE_INDEX: int = 1
+
+
+def get_current_space_name() -> str:
+    """获取当前会话独立的 TaskSpace 名称"""
+    return f"voice assistant web {int(time.time() // 3600)}_{_CURRENT_SPACE_INDEX}"
+
+
+def rotate_task_space():
+    """生成下一个全新的独立 TaskSpace，避免复用已结束空间的锁死状态"""
+    global _CURRENT_SPACE_INDEX, _CURRENT_ACTIVE_TAB_LABEL
+    _CURRENT_SPACE_INDEX += 1
+    _CURRENT_ACTIVE_TAB_LABEL = None
 
 
 def get_active_tab_label() -> Optional[str]:
@@ -33,20 +47,51 @@ def reset_active_tab():
 
 
 def build_page_setup_js(preferred_label: Optional[str]) -> str:
-    """生成统一的 taskSpace、tabs 检查与目标 page 获取的 JS 前导代码，杜绝冗余与标签解析漂移"""
+    """生成统一的 taskSpace、tabs 检查与目标 page 获取的 JS 前导代码，杜绝冗余、标签解析漂移与 page closed 异常"""
     safe_pref = json.dumps(preferred_label)
+    safe_space = json.dumps(get_current_space_name())
     return f"""const preferredLabel = {safe_pref};
-const task = await taskSpace("voice assistant web");
-const tabs = await task.tabs();
+const spaceName = {safe_space};
+const task = await taskSpace(spaceName);
+const tabs = (await task.tabs()) || [];
+
+function isValidLabel(l) {{
+    return typeof l === 'string' && /^[a-zA-Z][a-zA-Z0-9_-]*$/.test(l);
+}}
+
+let page = null;
+let currentActiveLabel = null;
 let activeTab = null;
-if (preferredLabel && tabs && tabs.length > 0) {{
+
+// 1. 如果有指定的活跃 label，且仍存在于当前有效 tabs 中，优先使用
+if (preferredLabel && isValidLabel(preferredLabel) && tabs.some(t => t.label === preferredLabel)) {{
     activeTab = tabs.find(t => t.label === preferredLabel);
+    try {{
+        page = task.page(preferredLabel);
+        currentActiveLabel = preferredLabel;
+    }} catch (e) {{
+        page = null;
+    }}
 }}
-if (!activeTab && tabs && tabs.length > 0) {{
-    activeTab = tabs.find(t => t.active) || tabs[tabs.length - 1];
+
+// 2. 从当前存活的 tabs 中挑选活跃或最新标签
+if (!page && tabs.length > 0) {{
+    activeTab = tabs.find(t => t.active && isValidLabel(t.label)) || tabs.find(t => isValidLabel(t.label));
+    if (activeTab && activeTab.label) {{
+        try {{
+            page = task.page(activeTab.label);
+            currentActiveLabel = activeTab.label;
+        }} catch (e) {{
+            page = null;
+        }}
+    }}
 }}
-const page = activeTab && activeTab.label ? task.page(activeTab.label) : task.page("p1");
-const currentActiveLabel = (activeTab && activeTab.label) ? activeTab.label : "p1";
+
+// 3. 若无可用存活页面，主动创建新页面
+if (!page) {{
+    page = await task.newPage();
+    currentActiveLabel = page.label;
+}}
 """
 
 
@@ -384,20 +429,125 @@ try {{
 async def browser_scroll(direction: str = "down") -> str:
     """
     在当前网页滚动窗口（自动作用于最新打开的页面或标签页）
+    支持: 'down', 'up', 'bottom' (滚到最底部), 'top' (回到顶部)
     """
-    delta = 800 if direction.lower() == "down" else -800
+    dir_lower = direction.lower()
+    if dir_lower in ["bottom", "底部", "最底", "最底部"]:
+        scroll_eval = "window.scrollTo(0, document.body.scrollHeight)"
+        desc = "拉到最底部"
+    elif dir_lower in ["top", "顶部", "最顶", "最顶部"]:
+        scroll_eval = "window.scrollTo(0, 0)"
+        desc = "回到最顶部"
+    elif dir_lower in ["up", "上"]:
+        scroll_eval = "window.scrollBy(0, -800)"
+        desc = "向上滚动"
+    else:
+        scroll_eval = "window.scrollBy(0, 800)"
+        desc = "向下滚动"
+
     setup_js = build_page_setup_js(_CURRENT_ACTIVE_TAB_LABEL)
     code = f"""{setup_js}
-await page.evaluate((d) => window.scrollBy(0, d), {delta});
-await page.waitForTimeout(600);
-console.log(JSON.stringify({{ ok: true, message: "已滚动页面", activeTabLabel: currentActiveLabel }}));
+await page.evaluate(() => {{ {scroll_eval}; }});
+await page.waitForTimeout(800);
+console.log(JSON.stringify({{ ok: true, message: "已{desc}", activeTabLabel: currentActiveLabel }}));
 """
-    res = await run_ego_js(code, timeout=6.0)
+    res = await run_ego_js(code, timeout=8.0)
     if res.get("ok"):
         if res.get("activeTabLabel"):
             set_active_tab_label(res["activeTabLabel"])
-        return f"已向{'下' if delta > 0 else '上'}滚动页面"
+        return f"已成功{desc}页面"
     return f"【失败】 滚动失败: {res.get('error')}"
+
+
+async def browser_get_comments(max_items: int = 3) -> Dict[str, Any]:
+    """
+    在当前页面（如新闻、文章、帖子）提取前 N 条用户评论或评论区状态
+    """
+    setup_js = build_page_setup_js(_CURRENT_ACTIVE_TAB_LABEL)
+    code = f"""{setup_js}
+const title = await page.title();
+const url = await page.url();
+
+const comments = await page.evaluate((maxCount) => {{
+    const res = [];
+    const selectors = [
+        "#ulcommentlist li .comm_content",
+        "#ulhotlist li .comm_content",
+        ".comm_content",
+        ".comment-content",
+        ".comment-body",
+        ".reply-item",
+        ".comment-item",
+        ".comm-body",
+        "[id^='comm_'] .content",
+        ".comm-text",
+        "#ulcommentlist li",
+        "#ulhotlist li",
+        ".comment",
+        ".reply-content"
+    ];
+    const els = Array.from(document.querySelectorAll(selectors.join(", ")));
+    for (const el of els) {{
+        const t = (el.innerText || el.textContent || "").trim().replace(/\\s+/g, ' ');
+        if (t.length >= 2 && !res.includes(t)) {{
+            res.push(t);
+            if (res.length >= maxCount) break;
+        }}
+    }}
+    if (res.length === 0) {{
+        const hintBox = document.querySelector("#pagecomment, #morecomm, #divcommentlist, .comm_list, #post_comment, [id*='comment']");
+        if (hintBox) {{
+            const hint = (hintBox.innerText || "").trim().replace(/\\s+/g, ' ');
+            if (hint && hint.length > 2) {{
+                res.push(`[提示] ${{hint.slice(0, 150)}}`);
+            }}
+        }}
+    }}
+    return res;
+}}, {max_items});
+
+console.log(JSON.stringify({{
+    ok: true,
+    title,
+    url,
+    comments,
+    count: comments.length,
+    activeTabLabel: currentActiveLabel
+}}));
+"""
+    res = await run_ego_js(code, timeout=9.0)
+    if res.get("ok"):
+        if res.get("activeTabLabel"):
+            set_active_tab_label(res["activeTabLabel"])
+        return res
+    return {"ok": False, "error": res.get("error", "提取评论失败"), "comments": []}
+
+
+async def browser_close(close_window: bool = False) -> str:
+    """
+    关闭当前语音助手专属的独立 Ego TaskSpace 中的所有标签页并轮转空间，不退出用户整个浏览器
+    """
+    safe_space = json.dumps(get_current_space_name())
+    code = f"""
+const task = await taskSpace({safe_space});
+try {{
+    const tabs = (await task.tabs()) || [];
+    for (const t of tabs) {{
+        if (t.label) {{
+            try {{
+                const p = task.page(t.label);
+                await p.close();
+            }} catch(err) {{}}
+        }}
+    }}
+    console.log(JSON.stringify({{ ok: true, message: "已成功关闭独立 TaskSpace 页面" }}));
+}} catch (e) {{
+    console.log(JSON.stringify({{ ok: false, error: String(e) }}));
+}}
+"""
+    await run_ego_js(code, timeout=6.0)
+    rotate_task_space()
+    return "已成功关闭 Ego Lite 独立任务空间（TaskSpace），保留浏览器正常运行"
 
 
 def get_browser_function_declarations():
@@ -474,13 +624,26 @@ def get_browser_function_declarations():
         ),
         types.FunctionDeclaration(
             name="browser_scroll",
-            description="在 Ego Lite 浏览器当前页面中向上或向下滚动屏幕浏览更多内容。",
+            description="在 Ego Lite 浏览器当前页面中向上或向下滚动屏幕浏览更多内容，支持滚动到底部（'bottom'）或顶部（'top'）。",
             parameters={
                 "type": "object",
                 "properties": {
                     "direction": {
                         "type": "string",
-                        "description": "滚动方向，'down' (向下滚动) 或 'up' (向上滚动)，默认 'down'"
+                        "description": "滚动方向，'down' (向下滚动), 'up' (向上滚动), 'bottom' (滚动到底部), 'top' (回到顶部)，默认 'down'"
+                    }
+                }
+            }
+        ),
+        types.FunctionDeclaration(
+            name="browser_close",
+            description="关闭当前浏览的网页标签页或彻底关闭退出 Ego Lite 浏览器窗口。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "close_window": {
+                        "type": "boolean",
+                        "description": "是否彻底退出浏览器应用窗口，默认为 true"
                     }
                 }
             }

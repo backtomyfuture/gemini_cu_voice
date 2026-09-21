@@ -12,7 +12,7 @@ Gemini 3.8 Live + kimi-cu / Ego Lite 实时语音桌面操作管家。
 - [gemini_live_cu.py](file:///Users/jarod/Documents/gemini_cu_voice/gemini_live_cu.py): 主程序与全双工 WebSocket 事件循环、Barge-in 打断流控及会话恢复。
 - [tool_policy.py](file:///Users/jarod/Documents/gemini_cu_voice/tool_policy.py): 安全策略层、高危按键阻断、单轮预算上限与调用去重治理。
 - [ego_browser_client.py](file:///Users/jarod/Documents/gemini_cu_voice/ego_browser_client.py): Ego Lite 浏览器控制客户端。
-- [test_suite.py](file:///Users/jarod/Documents/gemini_cu_voice/test_suite.py): 工业级 Layer 0~3 自动化测试套件（支持真实 PCM 音频全链路闭环测试）。
+- [test_suite.py](file:///Users/jarod/Documents/gemini_cu_voice/test_suite.py): 工业级 Layer 0~2 自动化测试套件（支持真实 PCM 音频全链路闭环测试）。
 - [run.sh](file:///Users/jarod/Documents/gemini_cu_voice/run.sh): 快捷启动脚本。
 
 ## Development & Test Commands
@@ -25,14 +25,14 @@ Gemini 3.8 Live + kimi-cu / Ego Lite 实时语音桌面操作管家。
 # 或者通过 uv 运行
 uv run --locked python gemini_live_cu.py
 
-# 运行自动化测试套件 (Layer 0 ~ Layer 3)
+# 运行自动化测试套件 (Layer 0 ~ Layer 2)
 uv run python test_suite.py
 
-# 运行特定测试层级
-uv run python test_suite.py --layer 0    # Layer 0: 安全策略与防死循环单测 (25项)
-uv run python test_suite.py --layer 1    # Layer 1: 真实应用深度闭环基座测试
-uv run python test_suite.py --layer 2    # Layer 2: 真实 PCM 语音驱动端到端评测
-uv run python test_suite.py --layer 3    # Layer 3: 硬件麦克风与自适应 VAD 检查
+# 运行特定测试层级或用例
+uv run python test_suite.py --layer 0    # Layer 0: 安全策略与防死循环单测 (28项)
+uv run python test_suite.py --layer 1    # Layer 1: 音频硬件识别与近场 VAD 门控健康检查
+uv run python test_suite.py --layer 2    # Layer 2: 真实 PCM 语音驱动全链路应用深度闭环评测 (gemini-3.8-live)
+uv run python test_suite.py --case calc  # 指定单用例真实语音测试 (calc, word, outlook, browser, notes, apps)
 ```
 
 ## Agent skills
