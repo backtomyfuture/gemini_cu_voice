@@ -560,11 +560,53 @@ def launch_mac_app(app_name: str, bundle_id: str = "") -> str:
 
 BROWSER_TOOLS = {decl.name for decl in get_browser_function_declarations()}
 
+# 领域专属热词列表：精准精简，去除通用词，专注高频混淆专有名词与核心应用名
 CUSTOM_ASR_VOCABULARY = [
-    "长鑫科技", "IT之家", "kimi-cu", "Safari", "Chrome", "Google Chrome",
-    "计算器", "备忘录", "访达", "Finder", "微信", "终端", "Terminal",
-    "百度", "哔哩哔哩", "Ego Lite", "音量", "窗口", "标签页",
+    "长鑫科技",
+    "IT之家",
+    "Ego Lite",
+    "kimi-cu",
+    "Discord",
+    "Outlook",
+    "Safari",
+    "Chrome",
+    "计算器",
+    "备忘录",
 ]
+
+# 声明为 NON_BLOCKING 的慢速探查/网络检索工具 (在 3.8-live 极速模型下允许模型先出垫字回复，完成后以 INTERRUPT 抢占播报结果)
+NON_BLOCKING_TOOLS = {
+    "browser_search",
+    "browser_open",
+    "browser_get_content",
+    "browser_list_actions",
+    "get_app_state",
+    "list_apps",
+}
+
+FRAME_DURATION_MS = 64  # 1024 samples @ 16kHz
+SERVER_SILENCE_DURATION_MS = 1200  # 服务端自动 VAD 停顿兜底门限
+CLIENT_SILENCE_CHUNKS = 12  # 客户端本地近场断句帧数 (12 * 64ms = 768ms)
+# 安全余量保证：客户端断句 (768ms) 先于服务端 (1200ms) 触发，保留 ~432ms 快路径优势
+
+
+def parse_duration_seconds(duration_str: Optional[str], default: float = 3.0) -> float:
+    """解析服务端返回的时间字符串（例如 '5s', '10.5s'）为秒数浮点值"""
+    if not duration_str:
+        return default
+    try:
+        clean = str(duration_str).strip().lower()
+        if clean.endswith("s"):
+            return float(clean[:-1])
+        return float(clean)
+    except Exception:
+        return default
+
+
+def is_handle_rejection(err: Exception) -> bool:
+    """仅当错误信息明确表明 Handle 过期、失效或 400 参数非法时判定为 Handle 失效；普通网络瞬断保留 Handle"""
+    err_msg = str(err).lower()
+    return any(k in err_msg for k in ["handle", "expired", "invalid session", "not found", "404", "session_not_found"])
 
 
 def build_gemini_function_declarations(
@@ -572,23 +614,30 @@ def build_gemini_function_declarations(
     is_extended_thinking: bool = False,
 ) -> List[types.FunctionDeclaration]:
     """
-    根据 Gemini 3.8 官方规范构建 FunctionDeclaration 并显式声明 behavior:
-    - Extended Thinking 模型：官方强制要求所有工具必须为 behavior="NON_BLOCKING"
-    - 3.8-live 极速模型：macOS 桌面物理操作与浏览器交互显式声明 behavior="BLOCKING"，保证严格串行
+    根据 Gemini 3.8 官方规范构建 FunctionDeclaration 并分级声明 behavior:
+    - Extended Thinking 模型：官方硬性规定所有工具必须为 behavior="NON_BLOCKING"
+    - 3.8-live 极速模型：
+      * 桌面物理写操作与窗口管理 (click, type_text, press_key, open_app, browser_click, browser_close 等) 显式声明 BLOCKING，保障严格串行
+      * 耗时只读探查与网页搜索 (browser_search, browser_open, get_app_state 等) 显式声明 NON_BLOCKING，避免生硬静音，完成后通过 INTERRUPT 播报
     """
-    target_behavior = (
+    gemini_functions = []
+    for t in mcp_tools:
+        if is_extended_thinking:
+            b = types.Behavior.NON_BLOCKING
+        else:
+            b = types.Behavior.NON_BLOCKING if t.name in NON_BLOCKING_TOOLS else types.Behavior.BLOCKING
+        gemini_functions.append(
+            types.FunctionDeclaration(
+                name=t.name,
+                description=t.description or "",
+                parameters=t.input_schema or {"type": "object", "properties": {}},
+                behavior=b,
+            )
+        )
+
+    open_app_behavior = (
         types.Behavior.NON_BLOCKING if is_extended_thinking else types.Behavior.BLOCKING
     )
-    gemini_functions = [
-        types.FunctionDeclaration(
-            name=t.name,
-            description=t.description or "",
-            parameters=t.input_schema or {"type": "object", "properties": {}},
-            behavior=target_behavior,
-        )
-        for t in mcp_tools
-    ]
-
     open_app_tool = types.FunctionDeclaration(
         name="open_app",
         description="在 macOS 上启动或前台激活任何应用程序（例如 计算器, 备忘录, 音乐, 微信, Safari, Chrome, 日历等）。如果应用未运行会自动启动，若已在运行则直接置顶激活到前台。用户说'打开XXX'时优先使用此工具。",
@@ -606,10 +655,24 @@ def build_gemini_function_declarations(
             },
             "required": ["name"]
         },
-        behavior=target_behavior,
+        behavior=open_app_behavior,
     )
     gemini_functions.append(open_app_tool)
-    gemini_functions.extend(get_browser_function_declarations(behavior=target_behavior.value))
+
+    if is_extended_thinking:
+        browser_decls = get_browser_function_declarations(behavior="NON_BLOCKING")
+    else:
+        browser_behavior_map = {
+            "browser_click": "BLOCKING",
+            "browser_close": "BLOCKING",
+            "browser_scroll": "BLOCKING",
+            "browser_open": "NON_BLOCKING",
+            "browser_search": "NON_BLOCKING",
+            "browser_get_content": "NON_BLOCKING",
+            "browser_list_actions": "NON_BLOCKING",
+        }
+        browser_decls = get_browser_function_declarations(behavior_map=browser_behavior_map)
+    gemini_functions.extend(browser_decls)
     return gemini_functions
 
 
@@ -1076,8 +1139,11 @@ async def run_session(
 
     thinking_config = None
     if "thinking" in selected_model:
-        level = os.environ.get("GEMINI_THINKING_LEVEL", "low").lower()
-        thinking_config = types.ThinkingConfig(include_thoughts=True, thinking_level=level)
+        raw_level = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip().lower()
+        if raw_level not in {"low", "medium", "high"}:
+            log_event("THINKING_LEVEL_INVALID", f"Invalid GEMINI_THINKING_LEVEL '{raw_level}', falling back to 'low'")
+            raw_level = "low"
+        thinking_config = types.ThinkingConfig(include_thoughts=True, thinking_level=raw_level)
 
     last_resumption_handle = session_state.get("handle")
     session_resumption_cfg = (
@@ -1092,13 +1158,21 @@ async def run_session(
 
     realtime_input_cfg = types.RealtimeInputConfig(
         automatic_activity_detection=types.AutomaticActivityDetection(
-            silence_duration_ms=1000,
+            silence_duration_ms=SERVER_SILENCE_DURATION_MS,
             prefix_padding_ms=100,
-            start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+            start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
             end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
         ),
         activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
     )
+
+    use_custom_vocab = not session_state.get("custom_vocab_disabled", False)
+    if use_custom_vocab:
+        input_audio_transcription = types.AudioTranscriptionConfig(
+            custom_vocabulary=CUSTOM_ASR_VOCABULARY
+        )
+    else:
+        input_audio_transcription = types.AudioTranscriptionConfig()
 
     config = types.LiveConnectConfig(
         response_modalities=["AUDIO"],
@@ -1112,9 +1186,7 @@ async def run_session(
                 )
             )
         ),
-        input_audio_transcription=types.AudioTranscriptionConfig(
-            custom_vocabulary=CUSTOM_ASR_VOCABULARY
-        ),
+        input_audio_transcription=input_audio_transcription,
         output_audio_transcription=types.AudioTranscriptionConfig(),
         thinking_config=thinking_config,
         tools=[types.Tool(function_declarations=gemini_functions)],
@@ -1132,7 +1204,7 @@ async def run_session(
     START_THRESHOLD = user_threshold or 65
     HOLD_THRESHOLD = max(30, min(45, int(START_THRESHOLD * 0.45)))
     ATTACK_FRAMES = 1  # 1 帧检测即响应，配合 1280ms 前滚缓冲确保首字辅音 100% 完整推入
-    SILENCE_CHUNKS = 13  # 约 832 毫秒断句窗口，与服务端 1000ms 自动 VAD 形成快慢双通道 Hybrid VAD
+    SILENCE_CHUNKS = CLIENT_SILENCE_CHUNKS  # 客户端本地 12 帧约 768ms，与服务端 1200ms 形成快慢双通道 Hybrid VAD
     MIN_PEAK_RMS = max(80, int(START_THRESHOLD * 1.2))
 
     # 分级打断门限 (Barge-in Threshold Hierarchy)
@@ -1160,9 +1232,12 @@ async def run_session(
     )
     tool_executor = ToolExecutor(mcp_session=mcp_session)
     send_lock = asyncio.Lock()
+    turn_vad_recorded = False
 
     def handle_voice_barge_in(reason: str, initial_chunks: Optional[List[bytes]] = None):
         """在事件循环主线程中线程安全地处理打断、清理队列与开启新轮次，完整注入打断前摇音频"""
+        nonlocal turn_vad_recorded
+        turn_vad_recorded = False
         turn_ctrl.interrupt(reason)
         audio_turn_queue.discard_turn()
         turn_ctrl.new_turn(f"speech_after_{reason}")
@@ -1172,6 +1247,8 @@ async def run_session(
 
     def handle_voice_speech_start(chunks_to_send: list):
         """在事件循环主线程中线程安全地开启新轮次并推送起呼前摇音频"""
+        nonlocal turn_vad_recorded
+        turn_vad_recorded = False
         turn_ctrl.new_turn("speech_start")
         for pr_chunk in chunks_to_send:
             audio_turn_queue.enqueue_audio(pr_chunk)
@@ -1262,43 +1339,29 @@ async def run_session(
                 last_cli_print_time = now
             return
 
-        # 3. 正在思考中 (支持气口续说自然合并；真正打断需达 INTERRUPT_THINKING_RMS 且持续2帧，杜绝微小环境杂音误打断)
+        # 3. 正在思考中 (扬声器静音，近场发声达 START_THRESHOLD 且持续2帧即作为新指令打断开启新轮次，彻底杜绝追加音频导致的语义反转)
         if turn_ctrl.state == STATE_THINKING:
-            time_since_speech_end = now - speech_end_time
-            if time_since_speech_end < 0.85 and not turn_ctrl.has_active_tool and not player.is_busy():
-                if rms >= START_THRESHOLD:
-                    # 视为同一轮长句的气口自然续接，直接切回 LISTENING，追加音频流，绝不清空队列
-                    loop.call_soon_threadsafe(turn_ctrl.set_state, STATE_LISTENING)
-                    is_speaking = True
-                    silence_count = 0
-                    speech_frames += 1
-                    log_event("SPEECH_CONTINUE", f"Merged speech continuation during thinking (rms={rms}, gap={time_since_speech_end:.2f}s)")
+            if rms >= START_THRESHOLD:
+                interrupt_frames += 1
+                if interrupt_frames >= 2:
+                    player.interrupt()
                     chunks = list(pre_roll)
-                    for c in chunks[-4:]:
-                        loop.call_soon_threadsafe(audio_turn_queue.enqueue_audio, c)
+                    loop.call_soon_threadsafe(handle_voice_barge_in, "thinking", chunks)
+                    is_speaking = True
+                    speech_frames = 1
+                    attack_count = 0
+                    silence_count = 0
+                    interrupt_frames = 0
+                    log_event("USER_INTERRUPT", f"User spoke during thinking, transitioned to new turn (rms={rms}, threshold={START_THRESHOLD})")
+                    sys.stdout.write(f"\r🎤 [\033[1;32m检测到打断并重新说话，实时响应中...\033[0m]                           \n")
+                    sys.stdout.flush()
+                    last_cli_print_time = now
                     return
             else:
-                if rms >= INTERRUPT_THINKING_RMS:
-                    interrupt_frames += 1
-                    if interrupt_frames >= 2:
-                        player.interrupt()
-                        chunks = list(pre_roll)
-                        loop.call_soon_threadsafe(handle_voice_barge_in, "thinking", chunks)
-                        is_speaking = True
-                        speech_frames = 1
-                        attack_count = 0
-                        silence_count = 0
-                        interrupt_frames = 0
-                        log_event("USER_INTERRUPT", f"User spoke during thinking, transitioned to new speech (rms={rms}, threshold={INTERRUPT_THINKING_RMS})")
-                        sys.stdout.write(f"\r🎤 [\033[1;32m检测到打断并重新说话，实时响应中...\033[0m]                           \n")
-                        sys.stdout.flush()
-                        last_cli_print_time = now
-                        return
-                else:
-                    interrupt_frames = 0
+                interrupt_frames = 0
 
             if should_print_cli:
-                sys.stdout.write(f"\r🧠 [\033[1;36mGemini 正在处理中...\033[0m] 音量: |{bars}| ({rms:3d}/{INTERRUPT_THINKING_RMS}) ")
+                sys.stdout.write(f"\r🧠 [\033[1;36mGemini 正在处理中...\033[0m] 音量: |{bars}| ({rms:3d}/{START_THRESHOLD}) ")
                 sys.stdout.flush()
                 last_cli_print_time = now
             return
@@ -1337,8 +1400,8 @@ async def run_session(
                     last_cli_print_time = now
             else:
                 silence_count += 1
-                # 动态断句容忍：刚起呼阶段（发声小于 20 帧约 1.2 秒），轻微放宽停顿容忍到 16 帧（约 1.0 秒，快于服务端兜底）
-                required_silence = 16 if speech_frames < 20 else SILENCE_CHUNKS
+                # 统一使用客户端本地断句帧数 CLIENT_SILENCE_CHUNKS (12 帧约 768ms，领先服务端 1200ms 约 432ms)
+                required_silence = SILENCE_CHUNKS
                 if should_print_cli:
                     sys.stdout.write(f"\r🎤 [\033[1;36m检测停顿 {silence_count}/{required_silence}\033[0m] 音量: |{bars}| ({rms:3d}) ")
                     sys.stdout.flush()
@@ -1378,6 +1441,31 @@ async def run_session(
                 log_event("SESSION_RESUMED", f"Resumed session with handle {last_resumption_handle[:16]}...")
                 sys.stdout.write(f"\r⚡ [\033[1;36m已通过官方 Handle 无缝恢复 Live 会话\033[0m]                       \n")
                 sys.stdout.flush()
+
+            # 核心：补发因网络断线或 GoAway 暂存的在途工具响应 (Pending Tool Responses)
+            pending_responses = session_state.get("pending_tool_responses")
+            if pending_responses:
+                try:
+                    await session.send_tool_response(function_responses=pending_responses)
+                    log_event("PENDING_TOOL_RESPONSES_RESENT", f"Successfully resent {len(pending_responses)} pending tool responses to new session")
+                    sys.stdout.write(f"\r⚡ [\033[1;36m已恢复重放前序在途的 {len(pending_responses)} 项工具操作结果\033[0m]                       \n")
+                    sys.stdout.flush()
+                    session_state["pending_tool_responses"] = []
+                except Exception as e:
+                    log_event("PENDING_TOOL_RESEND_FAIL", f"Failed to resend tool responses directly ({e}), falling back to text injection")
+                    fallback_text = "\n".join([
+                        f"[系统提示: 在重连前后台执行完毕的工具 '{getattr(r, 'name', 'tool')}' 结果: {getattr(r, 'response', {}).get('result', {}) if isinstance(getattr(r, 'response', None), dict) else getattr(r, 'response', {})}]"
+                        for r in pending_responses
+                    ])
+                    try:
+                        await session.send_client_content(
+                            turns=[types.Content(role="user", parts=[types.Part.from_text(text=fallback_text)])],
+                            turn_complete=True
+                        )
+                        log_event("PENDING_TOOL_FALLBACK_INJECTED", "Injected pending tool results via client_content fallback")
+                        session_state["pending_tool_responses"] = []
+                    except Exception as fb_err:
+                        log_event("PENDING_TOOL_FALLBACK_FAIL", f"Fallback injection also failed: {fb_err}")
 
             handshake_done = True
 
@@ -1508,16 +1596,22 @@ async def run_session(
                             func_name, func_args, cancellation_token=token
                         )
 
+                        sched = (
+                            types.FunctionResponseScheduling.INTERRUPT
+                            if ("thinking" not in selected_model and func_name in NON_BLOCKING_TOOLS)
+                            else None
+                        )
                         if not allowed:
                             log_event("POLICY_BLOCK", f"Tool {func_name} blocked: {policy_contract.summary}")
                             print(f"\n🛡️  [安全策略拦截] \033[1;31m{func_name}\033[0m: {policy_contract.summary}")
-                            function_responses.append(
-                                types.FunctionResponse(
-                                    name=func_name,
-                                    id=call.id,
-                                    response={"result": policy_contract.to_gemini_response()}
-                                )
-                            )
+                            resp_kwargs = {
+                                "name": func_name,
+                                "id": call.id,
+                                "response": {"result": policy_contract.to_gemini_response()},
+                            }
+                            if sched is not None:
+                                resp_kwargs["scheduling"] = sched
+                            function_responses.append(types.FunctionResponse(**resp_kwargs))
                             continue
 
                         log_event("TOOL_CALL", f"Calling {func_name} with args: {func_args}")
@@ -1531,27 +1625,38 @@ async def run_session(
                         print(f"✨ [{func_name} 完成] ({cost_ms}ms, {contract.summary[:60]})")
                         current_tools_executed.append(f"{func_name}: {contract.summary[:60]}")
 
-                        function_responses.append(
-                            types.FunctionResponse(
-                                name=func_name,
-                                id=call.id,
-                                response={"result": contract.to_gemini_response()}
-                            )
-                        )
+                        resp_kwargs = {
+                            "name": func_name,
+                            "id": call.id,
+                            "response": {"result": contract.to_gemini_response()},
+                        }
+                        if sched is not None:
+                            resp_kwargs["scheduling"] = sched
+                        function_responses.append(types.FunctionResponse(**resp_kwargs))
 
                     if token.is_cancelled or not turn_ctrl.is_current_turn(target_turn_id):
                         log_event("TOOL_CANCELLED_DROP", f"Tools result dropped due to turn cancellation (turn {target_turn_id})")
                         return
 
                     if function_responses:
-                        async with send_lock:
-                            await session.send_tool_response(function_responses=function_responses)
-                        log_event("TOOL_RESPONSE_SENT", f"Sent response for {len(function_responses)} calls, waiting for Gemini summary")
-                        if turn_ctrl.is_current_turn(target_turn_id):
-                            turn_ctrl.waiting_tool_summary = True
-                            turn_ctrl.set_state(STATE_THINKING)
+                        try:
+                            async with send_lock:
+                                await session.send_tool_response(function_responses=function_responses)
+                            log_event("TOOL_RESPONSE_SENT", f"Sent response for {len(function_responses)} calls, waiting for Gemini summary")
+                            if turn_ctrl.is_current_turn(target_turn_id):
+                                turn_ctrl.waiting_tool_summary = True
+                                turn_ctrl.set_state(STATE_THINKING)
+                        except Exception as send_err:
+                            log_event("TOOL_RESPONSE_SEND_FAIL", f"Failed to send tool response: {send_err}. Stashing into pending_tool_responses.")
+                            pending_list = session_state.setdefault("pending_tool_responses", [])
+                            pending_list.extend(function_responses)
+                            raise send_err
                 except asyncio.CancelledError:
                     log_event("TOOL_TASK_CANCELLED", f"Active tool task cancelled for turn {target_turn_id}")
+                    if function_responses and go_away_time_left is not None:
+                        log_event("STASH_GOAWAY_CANCELLED_TOOL", f"Stashing {len(function_responses)} tool responses cancelled during GoAway")
+                        pending_list = session_state.setdefault("pending_tool_responses", [])
+                        pending_list.extend(function_responses)
                 except Exception as e:
                     log_event("TOOL_TASK_ERROR", f"Error in execute_tools_task: {e}")
                 finally:
@@ -1634,6 +1739,12 @@ async def run_session(
 
                             # 2. 模型回复内容（思考、文本与音频）
                             if response.server_content and response.server_content.model_turn:
+                                if not turn_vad_recorded:
+                                    turn_vad_recorded = True
+                                    if is_speaking:
+                                        log_event("SERVER_VAD_WON", "Server VAD triggered turn completion before client finished (server won race)")
+                                    else:
+                                        log_event("CLIENT_VAD_WON", "Client near-field VAD won race (fast path)")
                                 turn_ctrl.waiting_tool_summary = False
                                 for part in response.server_content.model_turn.parts:
                                     if part.text:
@@ -1676,6 +1787,7 @@ async def run_session(
                                     current_user_transcript = []
                                     current_model_transcript = []
                                     current_tools_executed = []
+                                    turn_vad_recorded = False
 
                                     completed_turn_id = turn_ctrl.current_turn_id
 
@@ -1733,10 +1845,13 @@ async def run_session(
             if reconnect_event.is_set():
                 if go_away_time_left is not None:
                     if turn_ctrl.has_active_tool:
+                        parsed_sec = parse_duration_seconds(go_away_time_left, default=3.0)
+                        wait_budget = max(0.5, min(parsed_sec - 0.5, 3.0))
+                        log_event("GOAWAY_DRAIN_WAIT", f"Waiting up to {wait_budget:.2f}s for active tool tasks before reconnect (go_away_time_left={go_away_time_left})")
                         try:
                             await asyncio.wait_for(
                                 asyncio.shield(asyncio.gather(*list(turn_ctrl.active_tool_tasks), return_exceptions=True)),
-                                timeout=1.5
+                                timeout=wait_budget
                             )
                         except Exception:
                             pass
@@ -1746,7 +1861,12 @@ async def run_session(
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        if last_resumption_handle and not handshake_done:
+        err_msg = str(e).lower()
+        if "custom_vocabulary" in err_msg or "custom vocabulary" in err_msg:
+            log_event("CUSTOM_VOCAB_DISABLED", f"Server rejected custom_vocabulary ({e}), disabling for subsequent sessions")
+            session_state["custom_vocab_disabled"] = True
+
+        if last_resumption_handle and not handshake_done and is_handle_rejection(e):
             raise ResumptionHandleExpiredError(f"Failed to resume session with handle {last_resumption_handle[:16]}...: {e}") from e
         raise
 

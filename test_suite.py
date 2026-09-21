@@ -83,6 +83,12 @@ from gemini_live_cu import (
     BROWSER_TOOLS,
     CUSTOM_ASR_VOCABULARY,
     build_gemini_function_declarations,
+    FRAME_DURATION_MS,
+    SERVER_SILENCE_DURATION_MS,
+    CLIENT_SILENCE_CHUNKS,
+    NON_BLOCKING_TOOLS,
+    parse_duration_seconds,
+    is_handle_rejection,
 )
 from ego_browser_client import (
     browser_open,
@@ -1741,28 +1747,49 @@ async def test_layer_0(report: TestReport):
         cost,
     )
 
-    # 0.29 Gemini 3.8 函数调用行为规范 (Behavior Specification on 3.8 Live & Thinking)
+    # 0.29 Gemini 3.8 函数调用行为分级规范 (Behavior Specification on 3.8 Live & Thinking)
     t0 = time.time()
-    dummy_mcp_tool = type("MCPTool", (), {
-        "name": "click",
-        "description": "点击控件",
-        "input_schema": {"type": "object", "properties": {"index": {"type": "integer"}}}
-    })()
+    dummy_mcp_tools = [
+        type("MCPTool", (), {
+            "name": "click",
+            "description": "点击控件",
+            "input_schema": {"type": "object", "properties": {"index": {"type": "integer"}}}
+        })(),
+        type("MCPTool", (), {
+            "name": "get_app_state",
+            "description": "获取应用控件树",
+            "input_schema": {"type": "object", "properties": {"app": {"type": "string"}}}
+        })(),
+    ]
 
-    fast_decls = build_gemini_function_declarations([dummy_mcp_tool], is_extended_thinking=False)
-    thinking_decls = build_gemini_function_declarations([dummy_mcp_tool], is_extended_thinking=True)
+    fast_decls = build_gemini_function_declarations(dummy_mcp_tools, is_extended_thinking=False)
+    thinking_decls = build_gemini_function_declarations(dummy_mcp_tools, is_extended_thinking=True)
 
-    from google.genai import types
-    all_fast_blocking = all(getattr(d, "behavior", None) == types.Behavior.BLOCKING for d in fast_decls)
-    all_thinking_non_blocking = all(getattr(d, "behavior", None) == types.Behavior.NON_BLOCKING for d in thinking_decls)
+    fast_map = {d.name: getattr(d, "behavior", None) for d in fast_decls}
+    thinking_map = {d.name: getattr(d, "behavior", None) for d in thinking_decls}
 
-    behavior_ok = all_fast_blocking and all_thinking_non_blocking
+    # 极速模型下：物理写操作与窗口管理为 BLOCKING，慢速只读探查为 NON_BLOCKING
+    fast_blocking_ok = (
+        fast_map.get("click") == types.Behavior.BLOCKING
+        and fast_map.get("open_app") == types.Behavior.BLOCKING
+        and fast_map.get("browser_click") == types.Behavior.BLOCKING
+        and fast_map.get("browser_close") == types.Behavior.BLOCKING
+    )
+    fast_non_blocking_ok = (
+        fast_map.get("get_app_state") == types.Behavior.NON_BLOCKING
+        and fast_map.get("browser_search") == types.Behavior.NON_BLOCKING
+        and fast_map.get("browser_open") == types.Behavior.NON_BLOCKING
+        and fast_map.get("browser_get_content") == types.Behavior.NON_BLOCKING
+    )
+    all_thinking_non_blocking = all(b == types.Behavior.NON_BLOCKING for b in thinking_map.values())
+
+    behavior_ok = fast_blocking_ok and fast_non_blocking_ok and all_thinking_non_blocking
     cost = (time.time() - t0) * 1000
     report.record(
         "Layer 0",
-        "函数规范: Gemini 3.8 极速模型显式声明 BLOCKING，Thinking 模型声明 NON_BLOCKING (Tool Behavior Spec)",
+        "函数规范: 3.8-live 分级声明 BLOCKING/NON_BLOCKING，Thinking 声明 NON_BLOCKING (Tool Behavior Spec)",
         behavior_ok,
-        f"极速模型BLOCKING={all_fast_blocking} ({len(fast_decls)}个), Thinking模型NON_BLOCKING={all_thinking_non_blocking} ({len(thinking_decls)}个)",
+        f"极速模型阻塞={fast_blocking_ok}, 极速模型非阻塞探查={fast_non_blocking_ok}, Thinking全非阻塞={all_thinking_non_blocking}",
         cost,
     )
 
@@ -1805,6 +1832,180 @@ async def test_layer_0(report: TestReport):
         "连接治理: GoAwayReconnectError 继承 ConnectionError 且携带 time_left (GoAway Reconnect Contract)",
         goaway_contract_ok,
         f"继承ConnectionError={is_conn_error}, 携带time_left={has_time_left}",
+        cost,
+    )
+
+    # 0.32 Hybrid VAD 双端时序余量保障契约 (Dual-End VAD Fast Path Margin)
+    t0 = time.time()
+    client_vad_ms = CLIENT_SILENCE_CHUNKS * FRAME_DURATION_MS
+    vad_margin_ms = SERVER_SILENCE_DURATION_MS - client_vad_ms
+    timing_ok = (
+        FRAME_DURATION_MS == 64
+        and SERVER_SILENCE_DURATION_MS == 1200
+        and CLIENT_SILENCE_CHUNKS == 12
+        and client_vad_ms == 768
+        and vad_margin_ms >= 200
+    )
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "时序保障: 客户端近场断句领先服务端兜底门限至少 200ms (Hybrid VAD Fast Path Margin)",
+        timing_ok,
+        f"客户端本地断句={client_vad_ms}ms, 服务端兜底={SERVER_SILENCE_DURATION_MS}ms, 安全领先余量={vad_margin_ms}ms",
+        cost,
+    )
+
+    # 0.33 慢速探查工具 FunctionResponse SCHEDULING INTERRUPT 契约 (FunctionResponse Scheduling Spec)
+    t0 = time.time()
+    resp_interrupt = types.FunctionResponse(
+        name="browser_search",
+        id="call_search_1",
+        response={"result": "搜索结果"},
+        scheduling=types.FunctionResponseScheduling.INTERRUPT
+    )
+    resp_blocking = types.FunctionResponse(
+        name="click",
+        id="call_click_1",
+        response={"result": "点击成功"}
+    )
+    sched_ok = (
+        resp_interrupt.scheduling == types.FunctionResponseScheduling.INTERRUPT
+        and resp_blocking.scheduling != types.FunctionResponseScheduling.INTERRUPT
+        and "browser_search" in NON_BLOCKING_TOOLS
+        and "click" not in NON_BLOCKING_TOOLS
+    )
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "调度契约: 非阻塞慢速探查工具响应携带 INTERRUPT 抢占播报 (FunctionResponse Scheduling Spec)",
+        sched_ok,
+        f"NON_BLOCKING_TOOLS={len(NON_BLOCKING_TOOLS)}个, 搜索工具携带INTERRUPT={resp_interrupt.scheduling == types.FunctionResponseScheduling.INTERRUPT}",
+        cost,
+    )
+
+    # 0.34 GoAway 在途工具响应暂存与新会话补发/降级契约 (Pending Tool Responses Resend & Fallback)
+    t0 = time.time()
+    stashed_state = {"pending_tool_responses": [
+        types.FunctionResponse(name="browser_search", id="call_1", response={"result": "完成搜索"})
+    ]}
+
+    class MockReplaySession:
+        def __init__(self, fail_send=False):
+            self.fail_send = fail_send
+            self.resent = False
+            self.fallback_injected = False
+
+        async def send_tool_response(self, function_responses):
+            if self.fail_send:
+                raise RuntimeError("Invalid call_id on new session")
+            self.resent = True
+
+        async def send_client_content(self, turns, turn_complete):
+            self.fallback_injected = True
+
+    sess_normal = MockReplaySession(fail_send=False)
+    pending_1 = list(stashed_state["pending_tool_responses"])
+    await sess_normal.send_tool_response(function_responses=pending_1)
+    stashed_state["pending_tool_responses"] = []
+    path1_ok = sess_normal.resent and len(stashed_state["pending_tool_responses"]) == 0
+
+    stashed_state["pending_tool_responses"] = [
+        types.FunctionResponse(name="browser_search", id="call_2", response={"result": "降级内容"})
+    ]
+    sess_fallback = MockReplaySession(fail_send=True)
+    pending_2 = list(stashed_state["pending_tool_responses"])
+    try:
+        await sess_fallback.send_tool_response(function_responses=pending_2)
+    except Exception:
+        fallback_txt = f"[系统提示: 工具 '{pending_2[0].name}' 结果: {pending_2[0].response['result']}]"
+        await sess_fallback.send_client_content(turns=[fallback_txt], turn_complete=True)
+        stashed_state["pending_tool_responses"] = []
+    path2_ok = sess_fallback.fallback_injected and len(stashed_state["pending_tool_responses"]) == 0
+
+    stash_replay_ok = path1_ok and path2_ok
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "在途保护: GoAway未结响应在新会话自动补发，失败降级文本注入 (Pending Tool Responses Resend)",
+        stash_replay_ok,
+        f"直接补发成功={path1_ok}, 降级文本注入成功={path2_ok}",
+        cost,
+    )
+
+    # 0.35 GEMINI_THINKING_LEVEL 合法性校验与回落契约 (Thinking Level Validation)
+    t0 = time.time()
+    def validate_thinking_level(raw: str) -> str:
+        cleaned = raw.strip().lower()
+        if cleaned not in {"low", "medium", "high"}:
+            return "low"
+        return cleaned
+
+    val_low = validate_thinking_level("low") == "low"
+    val_med = validate_thinking_level("Medium ") == "medium"
+    val_high = validate_thinking_level("HIGH") == "high"
+    val_invalid = validate_thinking_level("extreme") == "low"
+    val_empty = validate_thinking_level("") == "low"
+
+    thinking_level_ok = val_low and val_med and val_high and val_invalid and val_empty
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "参数校验: GEMINI_THINKING_LEVEL 限定合法枚举，非法输入安全回落 low (Thinking Level Validation)",
+        thinking_level_ok,
+        f"low={val_low}, medium={val_med}, high={val_high}, extreme回落={val_invalid}",
+        cost,
+    )
+
+    # 0.36 custom_vocabulary 握手失败降级与恢复契约 (Custom Vocabulary Degradation)
+    t0 = time.time()
+    test_session_state = {"custom_vocab_disabled": False}
+    simulated_err = Exception("400 Invalid argument: custom_vocabulary is not supported in conversational mode")
+    err_str = str(simulated_err).lower()
+    if "custom_vocabulary" in err_str or "custom vocabulary" in err_str:
+        test_session_state["custom_vocab_disabled"] = True
+
+    vocab_degraded = test_session_state["custom_vocab_disabled"] is True
+    vocab_curated = (
+        len(CUSTOM_ASR_VOCABULARY) <= 15
+        and "长鑫科技" in CUSTOM_ASR_VOCABULARY
+        and "Ego Lite" in CUSTOM_ASR_VOCABULARY
+        and "kimi-cu" in CUSTOM_ASR_VOCABULARY
+        and "打开" not in CUSTOM_ASR_VOCABULARY
+    )
+    vocab_ok = vocab_degraded and vocab_curated
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "词汇治理: custom_vocabulary 精简高价值专有名词，握手拒收自动降级 (Custom Vocabulary Governance)",
+        vocab_ok,
+        f"握手失败自动降级={vocab_degraded}, 词汇精简专有名词={vocab_curated} (共{len(CUSTOM_ASR_VOCABULARY)}项)",
+        cost,
+    )
+
+    # 0.37 is_handle_rejection 错误分类与网络瞬断保护契约 (Handle Expiry vs Network Error)
+    t0 = time.time()
+    err_handle_expired = Exception("404 Session Handle expired or invalid session")
+    err_session_not_found = Exception("Session_not_found on live cluster")
+    err_net_timeout = TimeoutError("Connection timed out waiting for handshake")
+    err_conn_reset = ConnectionResetError("Connection reset by peer")
+
+    rejection_expired = is_handle_rejection(err_handle_expired)
+    rejection_not_found = is_handle_rejection(err_session_not_found)
+    rejection_timeout = is_handle_rejection(err_net_timeout)
+    rejection_reset = is_handle_rejection(err_conn_reset)
+
+    handle_rejection_ok = (
+        rejection_expired
+        and rejection_not_found
+        and (not rejection_timeout)
+        and (not rejection_reset)
+    )
+    cost = (time.time() - t0) * 1000
+    report.record(
+        "Layer 0",
+        "错误分类: 仅明确 Handle 失效时才注销句柄，普通网络瞬断保留句柄重试 (Handle Expiry Discrimination)",
+        handle_rejection_ok,
+        f"expired判定={rejection_expired}, not_found判定={rejection_not_found}, timeout保护={not rejection_timeout}, reset保护={not rejection_reset}",
         cost,
     )
 

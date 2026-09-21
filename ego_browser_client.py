@@ -571,11 +571,16 @@ try {{
     return "已成功关闭 Ego Lite 独立任务空间（TaskSpace），保留浏览器正常运行"
 
 
-def get_browser_function_declarations(behavior: Optional[str] = None):
-    """返回供 Gemini 注册使用的 Ego Lite 浏览器功能声明列表，支持按模型指定 behavior (BLOCKING/NON_BLOCKING)"""
+def get_browser_function_declarations(
+    behavior: Optional[str] = None,
+    behavior_map: Optional[Dict[str, str]] = None
+):
+    """返回供 Gemini 注册使用的 Ego Lite 浏览器功能声明列表，支持按模型指定全局 behavior 或按工具名称指定 behavior_map"""
     from google.genai import types
 
-    kwargs = {"behavior": behavior} if behavior else {}
+    def _get_kw(name: str):
+        b = (behavior_map.get(name) if behavior_map else None) or behavior
+        return {"behavior": b} if b else {}
 
     return [
         types.FunctionDeclaration(
@@ -591,7 +596,7 @@ def get_browser_function_declarations(behavior: Optional[str] = None):
                 },
                 "required": ["url"]
             },
-            **kwargs,
+            **_get_kw("browser_open"),
         ),
         types.FunctionDeclaration(
             name="browser_search",
@@ -610,7 +615,7 @@ def get_browser_function_declarations(behavior: Optional[str] = None):
                 },
                 "required": ["query"]
             },
-            **kwargs,
+            **_get_kw("browser_search"),
         ),
         types.FunctionDeclaration(
             name="browser_get_content",
@@ -619,7 +624,7 @@ def get_browser_function_declarations(behavior: Optional[str] = None):
                 "type": "object",
                 "properties": {}
             },
-            **kwargs,
+            **_get_kw("browser_get_content"),
         ),
         types.FunctionDeclaration(
             name="browser_list_actions",
@@ -633,7 +638,7 @@ def get_browser_function_declarations(behavior: Optional[str] = None):
                     }
                 }
             },
-            **kwargs,
+            **_get_kw("browser_list_actions"),
         ),
         types.FunctionDeclaration(
             name="browser_click",
@@ -648,7 +653,7 @@ def get_browser_function_declarations(behavior: Optional[str] = None):
                 },
                 "required": ["text"]
             },
-            **kwargs,
+            **_get_kw("browser_click"),
         ),
         types.FunctionDeclaration(
             name="browser_scroll",
@@ -662,7 +667,7 @@ def get_browser_function_declarations(behavior: Optional[str] = None):
                     }
                 }
             },
-            **kwargs,
+            **_get_kw("browser_scroll"),
         ),
         types.FunctionDeclaration(
             name="browser_close",
@@ -676,6 +681,6 @@ def get_browser_function_declarations(behavior: Optional[str] = None):
                     }
                 }
             },
-            **kwargs,
+            **_get_kw("browser_close"),
         )
     ]
